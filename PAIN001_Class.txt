@@ -1,0 +1,3105 @@
+// ------------------------------------------------------------------------
+// $URL:
+// http://qvsvn101/CustomerIntegration/iCIS%20Plugins/Mainline/ISO20022V3/source/com/qvalent/integration/plugins/iso20022v3/PAIN001ToPPIM.java
+// $
+//
+// $Revision: 59410 $
+// $Author: tonym $
+// $Date: 2026-09-23 10:54:56 +1000 (Wed, 23 Sep 2026) $
+//
+// Copyright 2010 Qvalent Pty. Ltd.
+// ------------------------------------------------------------------------
+package com.qvalent.integration.plugins.iso20022v3;
+ 
+import com.metiom.system.CoreException;
+import com.metiom.system.Log;
+import com.metiom.util.MoneyFormatter;
+import com.metiom.util.StringUtil;
+import com.metiom.xml.XMLDocument;
+import com.metiom.xml.XMLElement;
+import com.metiom.xml.sax.DOMExtractor;
+import com.qvalent.integration.plugin.script.util.iCISScriptDataFormatUtil;
+import com.qvalent.integration.plugin.script.util.iCISScriptEmailUtil;
+import com.qvalent.integration.plugin.script.util.iCISScriptLogUtil;
+import com.qvalent.integration.plugin.script.util.iCISScriptParameterUtil;
+import com.qvalent.integration.plugins.iso20022v3.constant.PaymentType;
+import com.qvalent.integration.plugins.iso20022v3.elements.StructuredRemittanceElement;
+import com.qvalent.integration.plugins.iso20022v3.util.PAIN002SFGenerator;
+import com.qvalent.integration.plugins.iso20022v3.util.PPIMSegmentBuilderUtil;
+import com.qvalent.integration.plugins.iso20022v3.util.XMLUtil;
+import com.qvalent.integration.plugins.payplus.payment.model.FileError;
+import com.qvalent.integration.script.GenericMessageProcessor;
+import com.qvalent.integration.script.MessageFacade;
+import com.qvalent.integration.script.MessageManagerFacade;
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.Reader;
+import java.io.StringReader;
+import java.io.StringWriter;
+import java.io.Writer;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.text.DecimalFormat;
+import java.text.NumberFormat;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Vector;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import javax.xml.stream.XMLEventReader;
+import javax.xml.stream.XMLEventWriter;
+import javax.xml.stream.XMLInputFactory;
+import javax.xml.stream.XMLOutputFactory;
+import javax.xml.stream.XMLStreamWriter;
+import javax.xml.transform.Source;
+import javax.xml.transform.stream.StreamSource;
+import javax.xml.validation.Schema;
+import javax.xml.validation.SchemaFactory;
+import javax.xml.validation.Validator;
+import org.apache.commons.lang.math.NumberUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.time.FastDateFormat;
+import org.w3c.dom.Document;
+import org.xml.sax.SAXException;
+ 
+public class PAIN001ToPPIM extends GenericMessageProcessor {
+ private static final String REFORMAT_LONG_NZ_ACCOUNT_NUMBERS = "reformatLongNZaccountNumbers";
+ private static final String INCLUDE_ULTIMATE_DEBTOR = "includeUltimateDebtor";
+ private static final String DOMICILED = "domiciled";
+ private static final String AUD_CURRENCY = "AUD";
+ private static final String NZD_CURRENCY = "NZD";
+ private static final String NZ_COUNTRY_CODE = "NZ";
+ private static final String AUSTRALIA_COUNTRY_CODE = "AU";
+ private static final String NEW_LINE = "\r\n";
+ private static final String CURRENCY_CODE_AUSTRALIA = "AUD";
+ private static final String CURRENCY_CODE_NEW_ZEALAND = "NZD";
+ private static final int DE_TRUNCATE_LENGTH = 18;
+ private static final int NZ_DE_TRUNCATE_LENGTH = 12;
+ private static final int BPAY_TRUNCATE_LENGTH = 18;
+ private static final int RTGS_TRUNCATE_LENGTH = 16;
+ private static final int OTT_TRUNCATE_LENGTH = 16;
+ private static final int CHQ_TRUNCATE_LENGTH = 15;
+ private static final int MAX_PAYMENT_AMOUNT = 100000000;
+ private static final int MAX_PAYMENT_COUNT = 200000;
+ private static final int MAX_MESSAGE_ID_LENGTH = 35;
+ private static final int MAX_CREDITOR_NAME_LENGTH = 140;
+ private static final int MAX_ERRORS = 50;
+ private static final int MIN_PAYMENT_PRECISION = 2;
+ 
+ private static final FastDateFormat RELATED_DATE_FORMAT =
+     FastDateFormat.getInstance("yyyy-MM-dd");
+ 
+ private static final FastDateFormat INVOICE_DATE_FORMAT =
+     FastDateFormat.getInstance("dd MMM yyyy");
+ 
+ private static final FastDateFormat CREATED_DATE_FORMAT =
+     FastDateFormat.getInstance("yyyy-MM-dd'T'HH:mm:ss");
+ 
+ private static final FastDateFormat PAYMENT_DATE_INPUT_FORMAT =
+     FastDateFormat.getInstance("yyyy-MM-dd");
+ 
+ private static final FastDateFormat PAYMENT_DATE_OUTPUT_FORMAT =
+     FastDateFormat.getInstance("dd MMM yyyy");
+ 
+ private final Pattern SHOULD_TRUNCATE_PATTERN = Pattern.compile("(?i)true|right|left");
+ 
+ private final Pattern AU_EFT_BSB_PATTERN = Pattern.compile("([0-9]{3})-{0,1}([0-9]{3})");
+ 
+ private final Pattern NZ_EFT_BSB_PATTERN = Pattern.compile("([0-9]{2})-{0,1}([0-9]{4})");
+ 
+ private final Pattern NZ_EFT_ACCOUNT_PATTERN =
+     Pattern.compile("0{0,1}([0-9]{7})0{0,2}([0-9]{2})");
+ 
+ private final Pattern NZ_EFT_ACCOUNT_ERROR_PATTERN = Pattern.compile("([0-9]{8})([0-9]{4})");
+ 
+ private final BigDecimal NEGATE = new BigDecimal(-1);
+ 
+ // Params
+ private static final String MSG_PARAM_PAYABLES_FILE_ID = "PayablesFileId";
+ private static final String PARAM_TOKENIZE_SETTLEMENT_REFERENCE = "tokenizeSettlementReference";
+ private static final String PARAM_ENABLE_REMITTANCES = "enableRemittances";
+ private static final String PARAM_TRUNCATE_LODGEMENT_REFERENCE = "truncateLodgementReference";
+ private static final String PARAM_INCLUDE_UNSTRUCTURED_REMITTANCE =
+     "includeUnstructuredRemittance";
+ private static final String PARAM_BUYER_CODE = "buyerCode";
+ private static final String PARAM_ACK_SYSTEM_CODE = "ackSystemCode";
+ private static final String PARAM_SYSTEM_CODE = "systemCode";
+ private static final String PARAM_FILENAME_FROM_PAYMENT_INFORMATION = "filenameFromPmtInf";
+ private static final String PARAM_MSG_ID = "CLIENT_GrpID";
+ private static final String PARAM_FILTER_SUCCESS_FILES = "filterSuccessFiles";
+ private static final String PARAM_USE_PAYEE_REFERENCE = "usePayeeReferenceForPayment";
+ private static final String PARAM_FORCE_CREDITOR_BIC_CODE = "forceCreditorBICCode";
+ private static final String PARAM_ALWAYS_USE_CREDIT_AGENT = "alwaysUseCreditAgentRoutingCode";
+ private static final String PARAM_NEGATE_CREDIT_NOTE_AMOUNTS = "negateCreditNoteAmounts";
+ private static final String PARAM_USE_CREDITOR_ACCOUNT_NAME = "useCdtrAcctName";
+ private static final String PARAM_USE_CREDITOR_ACCOUNT_NAME_FOR_NZOTT =
+     "useCreditorAccountNameForNZOTT";
+ private static final String PARAM_SKIP_DUPLICATE_FILE_CHECKS = "skipDuplicateFileChecks";
+ private static final String PARAM_USE_RETURN_TO_ADDRESS_IDENTIFIER =
+     "useReturnToAddressIdentifier";
+ private static final String PARAM_REJECT_INDIVIDUAL_PAYMENTS = "rejectIndividualPayments";
+ private static final String PARAM_FORCE_DEBTOR_ACCOUNT_CURRENCY_FOR_EXCHANGE =
+     "forceDebtorAccountCurrencyForExchange";
+ 
+ // PAIN001 XML Header Element Names
+ private static final String DOCUMENT_TYPE = "pain.001.001.03";
+ private static final String DEFAULT_ERROR_CODE = "FF01";
+ private static final String ELEMENT_DOCUMENT = "Document";
+ private static final String ELEMENT_PAIN = "CstmrCdtTrfInitn";
+ private static final String ELEMENT_GROUP_HEADER = "GrpHdr";
+ private static final String INITIATING_PARTY = "InitgPty";
+ private static final String ELEMENT_NAME = "Nm";
+ private static final String ELEMENT_CREATION_DATE_TIME = "CreDtTm";
+ 
+ // PAIN001 XML Detail Element Names
+ private static final String ELEMENT_CREDITOR = "Cdtr";
+ private static final String ELEMENT_DEBTOR = "Dbtr";
+ private static final String ELEMENT_ULTIMATE_DEBTOR = "UltmtDbtr";
+ private static final String ELEMENT_PAYMENT_METHOD = "PmtMtd";
+ private static final String ELEMENT_POSTAL_ADDRESS = "PstlAdr";
+ private static final String ELEMENT_ADDRESS_LINE = "AdrLine";
+ private static final String ELEMENT_POST_CODE = "PstCd";
+ private static final String ELEMENT_BUILDING_NUMBER = "BldgNb";
+ private static final String ELEMENT_STREET_NAME = "StrtNm";
+ private static final String ELEMENT_COUNTRY = "Ctry";
+ private static final String ELEMENT_COUNTRY_SUB_DIVISION = "CtrySubDvsn";
+ private static final String ELEMENT_TOWN_NAME = "TwnNm";
+ private static final String ELEMENT_PAYMENT_INFORMATION = "PmtInf";
+ private static final String ELEMENT_IBAN = "IBAN";
+ private static final String ELEMENT_ID = "Id";
+ private static final String ELEMENT_EXCHANGE_RATE_INFORMATION = "XchgRateInf";
+ private static final String ELEMENT_EXCHANGE_RATE = "XchgRate";
+ private static final String ELEMENT_EXCHANGE_REFERENCE = "CtrctId";
+ private static final String ELEMENT_OTHER = "Othr";
+ private static final String ELEMENT_CREDITOR_ACCOUNT = "CdtrAcct";
+ private static final String ELEMENT_DEBTOR_ACCOUNT = "DbtrAcct";
+ private static final String ELEMENT_INTERMEDIARY_AGENT = "IntrmyAgt1";
+ private static final String ELEMENT_FINANCIAL_INSTITUTION_ID = "FinInstnId";
+ private static final String ELEMENT_CLEARING_SYSTEM_MEMBER_ID = "ClrSysMmbId";
+ private static final String ELEMENT_MEMBER_ID = "MmbId";
+ private static final String ELEMENT_BANK_IDENTIFIER_CODE = "BIC";
+ private static final String ELEMENT_CREDITOR_AGENT = "CdtrAgt";
+ private static final String ELEMENT_DEBTOR_AGENT = "DbtrAgt";
+ private static final String ELEMENT_REQUIRED_EXECUTION_DATE = "ReqdExctnDt";
+ private static final String ELEMENT_CHARGE_BEARER = "ChrgBr";
+ private static final String ELEMENT_PAYMENT_INFORMATION_ID = "PmtInfId";
+ private static final String ELEMENT_MESSAGE_ID = "MsgId";
+ private static final String ELEMENT_BRANCH_ID = "BrnchId";
+ private static final String ELEMENT_ORG_ID = "OrgId";
+ private static final String ELEMENT_CREDIT_TRANSFER_TRANSACTION_INFORMATION = "CdtTrfTxInf";
+ private static final String ELEMENT_REMITTANCE_LOCATION_ELECTRONIC_ADDRESS = "RmtLctnElctrncAdr";
+ private static final String ELEMENT_RELATED_REMITTANCE_INFORMATION = "RltdRmtInf";
+ private static final String ELEMENT_REMITTANCE_ID = "RmtId";
+ private static final String ELEMENT_REMITTANCE_LOCATION_METHOD = "RmtLctnMtd";
+ private static final String ELEMENT_PAYMENT_ID = "PmtId";
+ private static final String ELEMENT_END_TO_END_ID = "EndToEndId";
+ private static final String ELEMENT_AMOUNT = "Amt";
+ private static final String ATTRIBUTE_CURRENCY = "Ccy";
+ private static final String ATTRIBUTE_CURRENCY_FULL = "Currency";
+ private static final String ELEMENT_INSTRUCTED_ID = "InstrId";
+ private static final String ELEMENT_INSTRUCTED_AMOUNT = "InstdAmt";
+ private static final String ELEMENT_SERVICE_LEVEL = "SvcLvl";
+ private static final String ELEMENT_CODE = "Cd";
+ private static final String ELEMENT_PAYMENT_TYPE_INFORMATION = "PmtTpInf";
+ private static final String ELEMENT_CATEGORY_PURPOSE = "CtgyPurp";
+ private static final String ELEMENT_LOCAL_INSTRUMENT = "LclInstrm";
+ private static final String ELEMENT_PROPRIETARY = "Prtry";
+ private static final String ELEMENT_PROPRIETARY_ACCOUNT = "PrtryAcct";
+ private static final String ELEMENT_CHEQUE_INSTRUMENT = "ChqInstr";
+ private static final String ELEMENT_DELIVERY_METHOD = "DlvryMtd";
+ private static final String ELEMENT_MEMO_FIELD = "MemoFld";
+ private static final String ELEMENT_FORMS_CODE = "FrmsCd";
+ private static final String ELEMENT_CHEQUE_NUMBER = "ChqNb";
+ private static final String ELEMENT_UNSTRUCTURED = "Ustrd";
+ private static final String ELEMENT_STRUCTURED = "Strd";
+ private static final String ELEMENT_REFERENCED_DOCUMENT_INFORMATION = "RfrdDocInf";
+ private static final String ELEMENT_NUMBER = "Nb";
+ private static final String ADDITIONAL_REMITTANCE_INFORMATION = "AddtlRmtInf";
+ private static final String ELEMENT_RELATED_DATE = "RltdDt";
+ private static final String ELEMENT_REFERENCED_DOCUMENT_AMOUNT = "RfrdDocAmt";
+ private static final String ELEMENT_REMITTED_AMOUNT = "RmtdAmt";
+ private static final String ELEMENT_CREDITOR_NOTE_AMOUNT = "CdtNoteAmt";
+ private static final String ELEMENT_DUE_PAYABLE_AMOUNT = "DuePyblAmt";
+ private static final String ELEMENT_ADJUSTMENT_AMOUNT_AND_REASON = "AdjstmntAmtAndRsn";
+ private static final String ELEMENT_CREDITOR_REFERENCE_INFORMATION = "CdtrRefInf";
+ private static final String ELEMENT_REFERENCE = "Ref";
+ private static final String ELEMENT_REMITTANCE_INFO = "RmtInf";
+ private static final String ELEMENT_TAX_AMOUNT = "TaxAmt";
+ private static final String ELEMENT_TAX = "Tax";
+ private static final String ELEMENT_TAX_ID = "TaxId";
+ private static final String ELEMENT_PRIVATE_ID = "PrvtId";
+ private static final String ELEMENT_SCHEME_NAME = "SchmeNm";
+ private static final String ELEMENT_CONTACT_DETAILS = "CtctDtls";
+ private static final String ELEMENT_EMAIL_ADDRESS = "EmailAdr";
+ 
+ // XML Remittance Element Names
+ private static final String REMITTANCE_LOCATION_METHOD_EMAIL = "EMAL";
+ private static final String REMITTANCE_LOCATION_METHOD_FAX = "FAXI";
+ private static final String REMITTANCE_LOCATION_METHOD_POST = "POST";
+ private static final String REMITTANCE_TYPE_POST = "POST";
+ private static final String REMITTANCE_TYPE_POST_RETURN = "POST_RETURN";
+ private static final String REMITTANCE_TYPE_POST_OVERSEAS = "POST_OS";
+ private static final String REMITTANCE_TYPE_EMAIL = "EMAIL";
+ private static final String REMITTANCE_TYPE_FAX = "FAX";
+ private static final String NAMESPACE_REGEX = " +xmlns=\"[^\"]+\"";
+ private static final String REMITTANCE_TYPE_NONE = "NONE";
+ private static final String PAYROLL_CATEGORY_PURPOSE_CODE = "SALA";
+ 
+ // Osko Scheme name
+ private static final String OSKO_SCHEME_NAME_BBAN = "BBAN";
+ private static final String OSKO_SCHEME_NAME_TELI = "TELI";
+ private static final String OSKO_SCHEME_NAME_EMAL = "EMAL";
+ private static final String OSKO_SCHEME_NAME_AUBN = "AUBN";
+ private static final String OSKO_SCHEME_NAME_ORGN = "ORGN";
+ 
+ // Member vars
+ private final List<String> myErrors = new LinkedList<>();
+ private final List<FileError> myFileErrors = new ArrayList<>();
+ private boolean hasBuyerCodeError = false;
+ 
+ private MessageManagerFacade myMessageManager = null;
+ private final Vector<Integer> myDetailRecords = new Vector<>();
+ private final Vector<Double> mySumOfTransactions = new Vector<>();
+ private final Vector<MessageFacade> myResultantMessages = new Vector<>();
+ private String myOrigFilename = null;
+ private String mySendToEmail = null;
+ private Log myLog;
+ private String myBuyerCode = null;
+ private String myOrgnlMsgId = null;
+ private String myTruncateLodgementReference;
+ private boolean myFilterSuccessFiles = false;
+ private MessageFacade myAckMessage = null;
+ private boolean myEnableRemittances = true;
+ private boolean myTokenizeSettlementReference = true;
+ private XMLOutputFactory myXMLOutputFactory = null;
+ private XMLInputFactory myXMLInputFactory = null;
+ private String myCreDtTime = null;
+ private boolean myIncludeUnstructuredRemittance = false;
+ private boolean myFilenameFromPmtInf = true;
+ private boolean myIsReformatLongNZAccountNumbers = false;
+ private String myInitgPtyNm = null;
+ private boolean myIsSpecificBuyerCodeUsed = false;
+ private boolean myUsePayeeReference = false;
+ private boolean myIncludeUltimateDebtor = true;
+ private boolean myAlwaysUseCreditAgentRoutingCode = true;
+ private boolean myNegateCreditNoteAmounts = true;
+ private boolean myUseCreditorAccountName = false;
+ private boolean myUseCreditorAccountNameForNZOTT = false;
+ 
+ // Existing functionality was to hardcode this to true
+ private boolean mySkipDuplicateFileChecks = true;
+ private boolean myUseReturnToAddressIdentifier = false;
+ private boolean myRejectIndividualPayments = false;
+ private boolean myForceDebtorAccountCurrencyForExchange = false;
+ 
+ @Override
+ public void processMessage(
+     final MessageFacade message,
+     final Map<String, String> parameters,
+     final Map<String, Object> context)
+     throws Exception {
+   myLog = iCISScriptLogUtil.getLog();
+   myMessageManager = (MessageManagerFacade) context.get("MessageManager");
+ 
+   myOrigFilename = message.getParameter(iCISScriptParameterUtil.MSG_PARAM_RECEIVED_FILE);
+ 
+   // Obtain parameters
+   final String systemCode = parameters.get(PARAM_SYSTEM_CODE);
+   if (StringUtil.isEmptyTrim(systemCode)) {
+     throw new CoreException(
+         "No target System Code parameter ('" + "systemCode') was provided to send data.");
+   }
+ 
+   mySendToEmail = parameters.get(iCISScriptParameterUtil.SEND_TO_EMAIL_PARAM);
+   if (!StringUtil.isEmptyTrim(mySendToEmail)) {
+     mySendToEmail =
+         iCISScriptDataFormatUtil.parseDataForiCISMessage(mySendToEmail, message, getDate());
+     parameters.put(iCISScriptParameterUtil.SEND_TO_EMAIL_PARAM, mySendToEmail);
+   }
+   // Ensure resulting value is not empty
+   if (StringUtil.isEmptyTrim(mySendToEmail)) {
+     throw new CoreException("No email address parameter " + "('sendToEmail') was provided.");
+   }
+ 
+   final String ackSystemCode = parameters.get(PARAM_ACK_SYSTEM_CODE);
+   if (StringUtil.isEmptyTrim(ackSystemCode)) {
+     throw new CoreException(
+         "No acknowledgment system code " + "('" + PARAM_ACK_SYSTEM_CODE + "') was provided.");
+   }
+ 
+   final String enableRemittanceStr = parameters.get(PARAM_ENABLE_REMITTANCES);
+   if (!StringUtil.isEmpty(enableRemittanceStr)) {
+     myEnableRemittances = Boolean.parseBoolean(enableRemittanceStr);
+   }
+ 
+   final String tokenizeSettlementReferenceStr =
+       parameters.get(PARAM_TOKENIZE_SETTLEMENT_REFERENCE);
+   if (!StringUtil.isEmpty(tokenizeSettlementReferenceStr)) {
+     myTokenizeSettlementReference = Boolean.parseBoolean(tokenizeSettlementReferenceStr);
+   }
+ 
+   // handle long NZ Account Numbers
+   myIsReformatLongNZAccountNumbers =
+       Boolean.parseBoolean(parameters.get(REFORMAT_LONG_NZ_ACCOUNT_NUMBERS));
+ 
+   myIncludeUnstructuredRemittance =
+       Boolean.parseBoolean(parameters.get(PARAM_INCLUDE_UNSTRUCTURED_REMITTANCE));
+ 
+   myTruncateLodgementReference = parameters.get(PARAM_TRUNCATE_LODGEMENT_REFERENCE);
+ 
+   myFilterSuccessFiles = Boolean.parseBoolean(parameters.get(PARAM_FILTER_SUCCESS_FILES));
+ 
+   // Defaults to true when not provided
+   if (!StringUtil.isEmptyTrim(parameters.get(PARAM_FILENAME_FROM_PAYMENT_INFORMATION))) {
+     myFilenameFromPmtInf =
+         Boolean.parseBoolean(parameters.get(PARAM_FILENAME_FROM_PAYMENT_INFORMATION));
+   }
+ 
+   myUsePayeeReference = Boolean.parseBoolean(parameters.get(PARAM_USE_PAYEE_REFERENCE));
+ 
+   // Defaults to true when not provided
+   if (!StringUtil.isEmptyTrim(parameters.get(INCLUDE_ULTIMATE_DEBTOR))) {
+     myIncludeUltimateDebtor = Boolean.parseBoolean(parameters.get(INCLUDE_ULTIMATE_DEBTOR));
+   }
+ 
+   if (!StringUtil.isEmptyTrim(parameters.get(PARAM_ALWAYS_USE_CREDIT_AGENT))) {
+     myAlwaysUseCreditAgentRoutingCode =
+         Boolean.parseBoolean(parameters.get(PARAM_ALWAYS_USE_CREDIT_AGENT));
+   }
+ 
+   if (!StringUtil.isEmptyTrim(parameters.get(PARAM_NEGATE_CREDIT_NOTE_AMOUNTS))) {
+     myNegateCreditNoteAmounts =
+         Boolean.parseBoolean(parameters.get(PARAM_NEGATE_CREDIT_NOTE_AMOUNTS));
+   }
+ 
+   if (!StringUtil.isEmptyTrim(parameters.get(PARAM_USE_CREDITOR_ACCOUNT_NAME))) {
+     myUseCreditorAccountName =
+         Boolean.parseBoolean(parameters.get(PARAM_USE_CREDITOR_ACCOUNT_NAME));
+   }
+ 
+   if (!StringUtil.isEmptyTrim(parameters.get(PARAM_USE_CREDITOR_ACCOUNT_NAME_FOR_NZOTT))) {
+     myUseCreditorAccountNameForNZOTT =
+         Boolean.parseBoolean(parameters.get(PARAM_USE_CREDITOR_ACCOUNT_NAME_FOR_NZOTT));
+   }
+ 
+   if (!StringUtil.isEmptyTrim(parameters.get(PARAM_SKIP_DUPLICATE_FILE_CHECKS))) {
+     mySkipDuplicateFileChecks =
+         Boolean.parseBoolean(parameters.get(PARAM_SKIP_DUPLICATE_FILE_CHECKS));
+   }
+ 
+   if (!StringUtil.isEmptyTrim(parameters.get(PARAM_USE_RETURN_TO_ADDRESS_IDENTIFIER))) {
+     myUseReturnToAddressIdentifier =
+         Boolean.parseBoolean(parameters.get(PARAM_USE_RETURN_TO_ADDRESS_IDENTIFIER));
+   }
+ 
+   if (!StringUtil.isEmptyTrim(parameters.get(PARAM_REJECT_INDIVIDUAL_PAYMENTS))) {
+     myRejectIndividualPayments =
+         Boolean.parseBoolean(parameters.get(PARAM_REJECT_INDIVIDUAL_PAYMENTS));
+   }
+ 
+   if (!StringUtil.isEmptyTrim(parameters.get(PARAM_FORCE_DEBTOR_ACCOUNT_CURRENCY_FOR_EXCHANGE))) {
+     myForceDebtorAccountCurrencyForExchange =
+         Boolean.parseBoolean(parameters.get(PARAM_FORCE_DEBTOR_ACCOUNT_CURRENCY_FOR_EXCHANGE));
+   }
+ 
+   // Perform a validation against the XSD
+   SchemaFactory factory = SchemaFactory.newInstance("http://www.w3.org/2001/XMLSchema");
+   Source schemaSource = new StreamSource(getResourceAsInputStream("pain.001.001.03.xsd"));
+   Schema schema = factory.newSchema(schemaSource);
+   Validator validator = schema.newValidator();
+ 
+   try (final Reader reader = message.getXmlReader(); ) {
+     final Source source = new StreamSource(reader);
+     validator.validate(source);
+   } catch (final SAXException ex) {
+     myErrors.add("Message #" + message.getMessageId() + " is not valid because " + ex);
+ 
+     if (StringUtils.isNotBlank(message.getParameter(MSG_PARAM_PAYABLES_FILE_ID))) {
+       final String buyerCode =
+           StringUtils.isBlank(message.getParameter("BuyerCode"))
+               ? message.getParameter("BUYER_CODE")
+               : message.getParameter("BuyerCode");
+ 
+       final MessageFacade badFileImport =
+           writeFileLevelErrorImport(
+               message,
+               buyerCode,
+               myOrigFilename,
+               message.getParameter(MSG_PARAM_PAYABLES_FILE_ID),
+               ex.getLocalizedMessage());
+ 
+       badFileImport.send(systemCode);
+     }
+   }
+ 
+   if (myErrors.isEmpty()) {
+     // Ack message needs to be the first child. In order to do that a
+     // stream must be used.
+     myAckMessage =
+         myMessageManager.createStreamedXmlMessage(PAIN002SFGenerator.PAIN_ISO, message);
+     // Obtain a message Id to ensure it is the first child message
+     myAckMessage.getMessageId();
+ 
+     try {
+       buildPaymentsPlusImportMessages(message, parameters);
+     } catch (final SAXException e) {
+       myErrors.add(e.getMessage());
+       myLog.logException(e, this.getClass().getName(), null);
+ 
+       // If we have a SAX style error and an uploaded file id, clear the resultant imports and
+       // send in an empty report that just details the fundamental error of the file.
+       if (StringUtils.isNotBlank(message.getParameter(MSG_PARAM_PAYABLES_FILE_ID))) {
+         final String buyerCode =
+             StringUtils.isBlank(message.getParameter("BuyerCode"))
+                 ? message.getParameter("BUYER_CODE")
+                 : message.getParameter("BuyerCode");
+ 
+         final MessageFacade badFileImport =
+             writeFileLevelErrorImport(
+                 message,
+                 buyerCode,
+                 myOrigFilename,
+                 message.getParameter(MSG_PARAM_PAYABLES_FILE_ID),
+                 e.getLocalizedMessage());
+ 
+         badFileImport.send(systemCode);
+       }
+ 
+       // Delete the existing resultant files as they are incorrect.
+       for (final MessageFacade badMessage : myResultantMessages) {
+         badMessage.deleteMessage();
+       }
+       myResultantMessages.clear();
+     } catch (final Exception e) {
+       myErrors.add(
+           "An unexpected exception occurred during the processing of "
+               + "this file. Please see the log.");
+       myLog.logException(e, this.getClass().getName(), null);
+     }
+   } else {
+     // We need to at least try and obtain the Original message Id and
+     // the Original message create time
+     try (final Reader inputReader = message.getXmlReader();
+         final DOMExtractor dom = new DOMExtractor(inputReader); ) {
+       final Document doc =
+           dom.getDocumentExcerpt(ELEMENT_GROUP_HEADER, ELEMENT_PAYMENT_INFORMATION);
+ 
+       final XMLDocument headerDoc = new XMLDocument(doc);
+       final XMLElement headerRoot = headerDoc.getDocumentElement();
+ 
+       myCreDtTime = XMLUtil.getElementValue(headerRoot, ELEMENT_CREATION_DATE_TIME, false);
+ 
+       myOrgnlMsgId = XMLUtil.getElementValue(headerRoot, ELEMENT_MESSAGE_ID, false);
+ 
+       if (!StringUtil.isEmptyTrim(myOrgnlMsgId)
+           && !(myOrgnlMsgId.length() <= MAX_MESSAGE_ID_LENGTH)) {
+         myErrors.add(
+             "The original message Id exceeds the maximum length allowed ("
+                 + MAX_MESSAGE_ID_LENGTH
+                 + ").");
+       }
+     } catch (final Exception e) {
+       myErrors.add(
+           "Could not parse document for Original Creation Date Time "
+               + "or Original Message Id.");
+     }
+ 
+     // If we couldn't find the Document/CstmrCdtTrfInitn/MsgId element
+     // then try obtain the
+     // value from a message parameter
+     if (StringUtil.isEmptyTrim(myOrgnlMsgId)) {
+       myOrgnlMsgId = message.getParameter(PARAM_MSG_ID);
+     }
+ 
+     // If we couldn't get the values set initial default values in case
+     // of validation errors
+     if (StringUtil.isEmptyTrim(myOrgnlMsgId)) {
+       myOrgnlMsgId = Long.toString(message.getMessageId());
+     }
+     if (StringUtil.isEmptyTrim(myCreDtTime)) {
+       myCreDtTime = CREATED_DATE_FORMAT.format(message.getCreatedDate());
+     }
+   }
+ 
+   final String companyName = myIsSpecificBuyerCodeUsed ? myInitgPtyNm : myBuyerCode;
+ 
+   final String grpSts =
+       myErrors.isEmpty() ? PAIN002SFGenerator.GRPSTS_ACCEPT : PAIN002SFGenerator.GRPSTS_REJECT;
+ 
+   if (myErrors.isEmpty()) {
+     int totalDetailRecord = 0;
+     double totalSumOfTransactions = 0;
+ 
+     for (int i = 0; i < myResultantMessages.size(); i++) {
+       myResultantMessages.get(i).send(systemCode);
+       totalDetailRecord += myDetailRecords.get(i);
+       totalSumOfTransactions += mySumOfTransactions.get(i);
+     }
+     myAckMessage =
+         PAIN002SFGenerator.generatePAIN002(
+             message,
+             parameters,
+             context,
+             PAIN002SFGenerator.GRPSTS_ACCEPT,
+             true,
+             companyName,
+             totalDetailRecord,
+             totalSumOfTransactions,
+             DOCUMENT_TYPE,
+             myOrgnlMsgId,
+             myCreDtTime,
+             null,
+             myOrigFilename,
+             myAckMessage,
+             null,
+             null,
+             getDate());
+   } else {
+     // If we have a buyer code to use, send the files into PaymentsPlus to
+     // report the files on the screens.
+     if (!hasBuyerCodeError) {
+       for (final MessageFacade myResultantMessage : myResultantMessages) {
+         myResultantMessage.send(systemCode);
+       }
+     }
+ 
+     myAckMessage =
+         PAIN002SFGenerator.generatePAIN002(
+             message,
+             parameters,
+             context,
+             PAIN002SFGenerator.GRPSTS_REJECT,
+             true,
+             companyName,
+             0,
+             0,
+             DOCUMENT_TYPE,
+             myOrgnlMsgId,
+             myCreDtTime,
+             null,
+             myOrigFilename,
+             myAckMessage,
+             DEFAULT_ERROR_CODE,
+             myErrors,
+             getDate());
+     sendFailureEmail(message, parameters);
+   }
+ 
+   // Perform a validation against the XSD
+   factory = SchemaFactory.newInstance("http://www.w3.org/2001/XMLSchema");
+   schemaSource = new StreamSource(getResourceAsInputStream("pain.002.001.03.xsd"));
+   schema = factory.newSchema(schemaSource);
+   validator = schema.newValidator();
+ 
+   // Filter success ack files if instructed to
+   if (!(myFilterSuccessFiles && PAIN002SFGenerator.GRPSTS_ACCEPT.equals(grpSts))) {
+     try (final Reader reader = myAckMessage.getXmlReader()) {
+       final Source source = new StreamSource(reader);
+       validator.validate(source);
+ 
+       myAckMessage.send(ackSystemCode);
+     } catch (final SAXException ex) {
+       // if the incoming message was valid and the ack message isn't,
+       // bubble up an exception to
+       // block children from being sent and alert support.
+       // ack messages from invalid incoming messages are expected to fail.
+       if (myErrors.isEmpty()) {
+         throw new CoreException(
+             "Message #"
+                 + myAckMessage.getMessageId()
+                 + " is not valid because \r\n"
+                 + ex.getMessage()
+                 + ". ");
+       }
+       myAckMessage.setFailed("Ack message failed XSD validation.");
+       myLog.logException(ex, this.getClass().getName(), "processMessage");
+     }
+   }
+ }
+ 
+ private void buildPaymentsPlusImportMessages(
+     final MessageFacade message, final Map<String, String> parameters)
+     throws SAXException, CoreException {
+   myXMLOutputFactory = XMLOutputFactory.newInstance();
+   myXMLOutputFactory.setProperty(XMLOutputFactory.IS_REPAIRING_NAMESPACES, false);
+   myXMLInputFactory = XMLInputFactory.newInstance();
+   myXMLInputFactory.setProperty(XMLInputFactory.IS_NAMESPACE_AWARE, false);
+ 
+   final PPIMSegmentBuilderUtil ppimBuilder =
+       new PPIMSegmentBuilderUtil(myXMLInputFactory, myXMLOutputFactory);
+ 
+   DOMExtractor dom = null;
+   String grpHdrPayLoad;
+   String fileName;
+ 
+   Writer writer = null;
+   XMLStreamWriter curWriter = null;
+   Reader inputReader;
+   try {
+     inputReader = message.getXmlReader();
+     dom = new DOMExtractor(inputReader);
+ 
+     final Document doc =
+         dom.getDocumentExcerpt(ELEMENT_GROUP_HEADER, ELEMENT_PAYMENT_INFORMATION);
+ 
+     final XMLDocument headerDoc = new XMLDocument(doc);
+     final XMLElement headerRoot = headerDoc.getDocumentElement();
+ 
+     myCreDtTime = XMLUtil.getElementValue(headerRoot, ELEMENT_CREATION_DATE_TIME, false);
+ 
+     String nbOfTxs = XMLUtil.getElementValue(headerRoot, "NbOfTxs", false);
+     nbOfTxs = nbOfTxs.replaceAll(",", "");
+     if (Integer.parseInt(nbOfTxs) > MAX_PAYMENT_COUNT) {
+       myErrors.add("Payment count exceeds limit.");
+       myFileErrors.add(
+           createFileError(
+               "PaymentInformation",
+               "GrpHdr/PmtInf/NbOfTxs",
+               nbOfTxs,
+               "Q99",
+               "",
+               "Payment count exceeds limit."));
+     }
+ 
+     fileName = XMLUtil.getElementValue(headerRoot, ELEMENT_MESSAGE_ID, false);
+     if (!StringUtil.isEmptyTrim(fileName) && !(fileName.length() <= MAX_MESSAGE_ID_LENGTH)) {
+       myErrors.add(
+           "The original message Id exceeds the maximum length allowed ("
+               + MAX_MESSAGE_ID_LENGTH
+               + ").");
+       myFileErrors.add(
+           createFileError(
+               "PaymentInformation",
+               "GrpHdr/PmtInf/MsgId",
+               fileName,
+               "Q99",
+               "",
+               "The original message Id exceeds the maximum length allowed ("
+                   + MAX_MESSAGE_ID_LENGTH
+                   + ")."));
+     }
+     myOrgnlMsgId = fileName;
+ 
+     try {
+       myInitgPtyNm =
+           XMLUtil.getElementValue(headerRoot, INITIATING_PARTY + "/" + ELEMENT_NAME, false);
+     } catch (final SAXException e) {
+       throw e;
+     }
+ 
+     grpHdrPayLoad = headerRoot.getXML(false);
+ 
+     grpHdrPayLoad = grpHdrPayLoad.replaceFirst(NAMESPACE_REGEX, "");
+ 
+     // prepare dom for next pass through
+     dom.close();
+     inputReader.close();
+     inputReader = message.getXmlReader();
+     dom = new DOMExtractor(inputReader);
+ 
+     Document currentDocument = null;
+ 
+     // change to array structures
+     final String[] rootElementNames = {
+       ELEMENT_DOCUMENT + "/" + ELEMENT_PAIN + "/" + ELEMENT_PAYMENT_INFORMATION,
+       ELEMENT_DOCUMENT
+           + "/"
+           + ELEMENT_PAIN
+           + "/"
+           + ELEMENT_PAYMENT_INFORMATION
+           + "/"
+           + ELEMENT_CREDIT_TRANSFER_TRANSACTION_INFORMATION
+     };
+ 
+     final String[] stopElementNames = {
+       ELEMENT_DOCUMENT
+           + "/"
+           + ELEMENT_PAIN
+           + "/"
+           + ELEMENT_PAYMENT_INFORMATION
+           + "/"
+           + ELEMENT_CREDIT_TRANSFER_TRANSACTION_INFORMATION,
+       ELEMENT_DOCUMENT
+           + "/"
+           + ELEMENT_PAIN
+           + "/"
+           + ELEMENT_PAYMENT_INFORMATION
+           + "/"
+           + ELEMENT_CREDIT_TRANSFER_TRANSACTION_INFORMATION
+           + "/"
+           + ELEMENT_REMITTANCE_INFO
+     };
+ 
+     String debtorBIC = null;
+     String paymentMethod = null;
+     String remittanceFooter = null;
+     String remittanceRecipientCode;
+     String recipientTaxId;
+     String remittanceLayoutCode = null;
+     String chargeBearer = null;
+     String returnToAddressIdentifier = null;
+     String remittanceLocationMethod = null;
+     String serviceLevelCode = null;
+     String categoryPurposeCode = null;
+     String remittanceType = "";
+     PaymentType paymentType = PaymentType.UNKNOWN;
+     String debtorAgentMemberId = null;
+     String debtorAgentAccountId = null;
+     String debtorBuildingNumber = null;
+     String debtorStreetName = null;
+     String debtorCurrency = null;
+     String debtorAcctCcy = null;
+     boolean isFCA = false;
+     String paymentDate = null;
+     String fileChargeBearer = null;
+     String fileReference = null;
+     String pmtInfXML = null;
+ 
+     final String payablesFileId = message.getParameter(MSG_PARAM_PAYABLES_FILE_ID);
+ 
+     /*
+       * When PAIN001 files are submitted via the PaymentsPlus screens, or via
+       * REST API we need to do some additional processing so that they appear
+       * correctly in the portal.
+       */
+     final boolean needsParentPayablesFile =
+         hasChildFiles(message) && StringUtils.isNotBlank(payablesFileId);
+     boolean hasWrittenEmptyParent = false;
+ 
+     final String domiciled = parameters.get(DOMICILED);
+     boolean isHeaderWritten = false;
+ 
+     while ((currentDocument = dom.getDocumentExcerpt(rootElementNames, stopElementNames))
+         != null) {
+       final XMLElement root = new XMLDocument(currentDocument).getDocumentElement();
+ 
+       final String rootName = root.getLocalName();
+       if (ELEMENT_PAYMENT_INFORMATION.equals(rootName)) {
+         isFCA = false;
+         if (curWriter != null) {
+           ppimBuilder.closePPIM(curWriter, writer);
+         }
+ 
+         // procure header data
+         paymentDate =
+             PAYMENT_DATE_OUTPUT_FORMAT.format(
+                 PAYMENT_DATE_INPUT_FORMAT.parse(
+                     XMLUtil.getElementValue(root, ELEMENT_REQUIRED_EXECUTION_DATE, false)));
+ 
+         fileChargeBearer = XMLUtil.getElementValue(root, ELEMENT_CHARGE_BEARER, true);
+ 
+         if (!myTokenizeSettlementReference) {
+           fileReference = XMLUtil.getElementValue(root, ELEMENT_PAYMENT_INFORMATION_ID, false);
+         }
+ 
+         if (myFilenameFromPmtInf) {
+           fileName =
+               myOrgnlMsgId
+                   + "-"
+                   + XMLUtil.getElementValue(root, ELEMENT_PAYMENT_INFORMATION_ID, false);
+         } else if (!StringUtil.isEmptyTrim(myOrigFilename)) {
+           fileName = myOrigFilename;
+ 
+           // Gets the last name in the pathname's name sequence
+           fileName = new File(fileName).getName();
+         }
+ 
+         myDetailRecords.add(0);
+         mySumOfTransactions.add(0.0);
+         myResultantMessages.add(
+             myMessageManager.createStreamedXmlMessage(
+                 "PaymentsPlusPaymentImportMessage", message));
+ 
+         debtorCurrency = null;
+         debtorBIC = XMLUtil.getElementValue(root, "DbtrAgt/FinInstnId/BIC", true);
+         debtorAcctCcy = XMLUtil.getElementValue(root, "DbtrAcct/Ccy", true);
+ 
+         if (StringUtil.isEmpty(debtorBIC)) {
+           // Check for the plugin parameter if missing element
+           debtorCurrency = AUD_CURRENCY;
+           if (!StringUtil.isEmpty(domiciled)) {
+             if (domiciled.equals(AUSTRALIA_COUNTRY_CODE)) {
+               debtorCurrency = AUD_CURRENCY;
+             } else if (domiciled.equals(NZ_COUNTRY_CODE)) {
+               debtorCurrency = NZD_CURRENCY;
+             }
+           }
+         } else {
+           if (debtorBIC.startsWith("WPACNZ")) {
+             debtorCurrency = NZD_CURRENCY;
+             if (StringUtils.isNotBlank(debtorAcctCcy) && !NZD_CURRENCY.equals(debtorAcctCcy)) {
+               isFCA = true;
+             }
+           } else {
+             debtorCurrency = AUD_CURRENCY;
+           }
+         }
+ 
+         paymentMethod = XMLUtil.getElementValue(root, ELEMENT_PAYMENT_METHOD, false);
+         if ("CHK".equals(paymentMethod) && CURRENCY_CODE_AUSTRALIA.equals(debtorCurrency)) {
+           paymentType = PaymentType.CHEQUE;
+         } else if ("CHK".equals(paymentMethod)
+             && CURRENCY_CODE_NEW_ZEALAND.equals(debtorCurrency)) {
+           paymentType = PaymentType.NZD_CHEQUE;
+         } else {
+           categoryPurposeCode =
+               XMLUtil.getElementValue(
+                   root,
+                   ELEMENT_PAYMENT_TYPE_INFORMATION
+                       + "/"
+                       + ELEMENT_CATEGORY_PURPOSE
+                       + "/"
+                       + ELEMENT_CODE,
+                   true);
+ 
+           final String localInstrumentCode =
+               XMLUtil.getElementValue(
+                   root,
+                   ELEMENT_PAYMENT_TYPE_INFORMATION
+                       + "/"
+                       + ELEMENT_LOCAL_INSTRUMENT
+                       + "/"
+                       + ELEMENT_CODE,
+                   true);
+ 
+           final String localInstrumentProprietary =
+               XMLUtil.getElementValue(
+                   root,
+                   ELEMENT_PAYMENT_TYPE_INFORMATION
+                       + "/"
+                       + ELEMENT_LOCAL_INSTRUMENT
+                       + "/"
+                       + ELEMENT_PROPRIETARY,
+                   true);
+ 
+           serviceLevelCode =
+               XMLUtil.getElementValue(
+                   root,
+                   ELEMENT_PAYMENT_TYPE_INFORMATION
+                       + "/"
+                       + ELEMENT_SERVICE_LEVEL
+                       + "/"
+                       + ELEMENT_CODE,
+                   "X2P1".equals(localInstrumentProprietary));
+ 
+           // AUD Logic Block
+           if (CURRENCY_CODE_AUSTRALIA.equals(debtorCurrency)) {
+             // X2P1 means OSKO
+             if ("X2P1".equals(localInstrumentProprietary)) {
+               paymentType = PaymentType.OSKO;
+             } else if ("NURG".equals(serviceLevelCode)) {
+               if ("IN".equals(localInstrumentCode)) {
+                 paymentType = PaymentType.AU_ACH_EFT;
+               } else if ("BPAY".equals(localInstrumentProprietary)) {
+                 paymentType = PaymentType.BPAY;
+               } else {
+                 paymentType = PaymentType.EFT;
+               }
+             } else if ("URGP".equals(serviceLevelCode)) {
+               if ("IN".equals(localInstrumentCode)) {
+                 paymentType = PaymentType.AU_OTT;
+               } else if ("OSKOFLEX".equals(localInstrumentProprietary)) {
+                 paymentType = PaymentType.PAYANYONE;
+                 if (StringUtils.isEmpty(fileReference)) {
+                   fileReference = fileName;
+                 }
+                 myTokenizeSettlementReference = false;
+                 fileReference = StringUtils.truncate(fileReference, 20);
+               } else {
+                 paymentType = PaymentType.RTGS;
+               }
+             } else {
+               myErrors.add(
+                   "Invalid Service Level Code "
+                       + "(PmtInf/PmtTpInf/SvcLvl/Cd) was provided: "
+                       + serviceLevelCode
+                       + ". "
+                       + "One of NURG or URGP is required.");
+ 
+               myFileErrors.add(
+                   createFileError(
+                       "PaymentTypeInformation",
+                       "PmtInf/PmtTpInf/SvcLvl/Cd",
+                       serviceLevelCode,
+                       "Q99",
+                       "",
+                       "Invalid Service Level Code "
+                           + "was provided. One of NURG or URGP is required."));
+             }
+           }
+           // NZD Logic block
+           else if (CURRENCY_CODE_NEW_ZEALAND.equals(debtorCurrency)) {
+             if ("NURG".equals(serviceLevelCode)) {
+               if ("IN".equals(localInstrumentCode)) {
+                 paymentType = PaymentType.NZ_ACH_EFT;
+               } else if ("BPAY".equals(localInstrumentProprietary)) {
+                 paymentType = PaymentType.BPAY;
+               } else {
+                 paymentType = PaymentType.NZD_EFT;
+               }
+             } else if ("URGP".equals(serviceLevelCode)) {
+               if ("IN".equals(localInstrumentCode)) {
+                 paymentType = PaymentType.NZ_OTT;
+               } else {
+                 myErrors.add(
+                     "Invalid local instrument code (PmtInf/PmtTpInf/LclInstrm/Cd) was provided: "
+                         + localInstrumentCode
+                         + ". IN was expected for this payment type.");
+ 
+                 myFileErrors.add(
+                     createFileError(
+                         "PaymentTypeInformation",
+                         "PmtInf-PmtTpInf-LclInstrm-Cd",
+                         localInstrumentCode,
+                         "Q99",
+                         "",
+                         "Invalid local instrument code was provided. "
+                             + "IN was expected for this payment type."));
+               }
+             } else {
+               myErrors.add(
+                   "Invalid Service Level Code "
+                       + "(PmtInf/PmtTpInf/SvcLvl/Cd/) was provided: "
+                       + serviceLevelCode
+                       + ". "
+                       + "One of NURG or URGP is required.");
+ 
+               myFileErrors.add(
+                   createFileError(
+                       "PaymentTypeInformation",
+                       "PmtInf/PmtTpInf/SvcLvl/Cd",
+                       serviceLevelCode,
+                       "Q99",
+                       "",
+                       "Invalid Service Level Code was provided. One of NURG or URGP is required."));
+             }
+           } else {
+             myErrors.add(
+                 "Invalid debtor account currency was provided: "
+                     + debtorCurrency
+                     + ". One of AUD or NZD is required.");
+ 
+             myFileErrors.add(
+                 createFileError(
+                     null,
+                     "DebtorCurrency",
+                     debtorCurrency,
+                     "Q99",
+                     "",
+                     "Invalid debtor account currency was provided. "
+                         + "One of AUD or NZD is required."));
+           }
+         }
+ 
+         writer = myResultantMessages.lastElement().getXmlWriter();
+         curWriter = myXMLOutputFactory.createXMLStreamWriter(writer);
+         isHeaderWritten = false;
+ 
+         pmtInfXML = root.getXML(false).replaceFirst(NAMESPACE_REGEX, "");
+ 
+         debtorAgentMemberId =
+             XMLUtil.getElementValue(
+                 root,
+                 ELEMENT_DEBTOR_AGENT
+                     + "/"
+                     + ELEMENT_FINANCIAL_INSTITUTION_ID
+                     + "/"
+                     + ELEMENT_CLEARING_SYSTEM_MEMBER_ID
+                     + "/"
+                     + ELEMENT_MEMBER_ID,
+                 true);
+ 
+         if (StringUtil.isEmptyTrim(debtorAgentMemberId)
+             || !AU_EFT_BSB_PATTERN.matcher(debtorAgentMemberId).matches()
+                 && !NZ_EFT_BSB_PATTERN.matcher(debtorAgentMemberId).matches()) {
+           debtorAgentMemberId =
+               XMLUtil.getElementValue(
+                   root, ELEMENT_DEBTOR_AGENT + "/" + ELEMENT_BRANCH_ID + "/" + ELEMENT_ID, true);
+ 
+           if (StringUtil.isEmptyTrim(debtorAgentMemberId)) {
+             debtorAgentMemberId = "";
+           }
+         }
+ 
+         debtorAgentAccountId =
+             XMLUtil.getElementValue(
+                 root,
+                 ELEMENT_DEBTOR_ACCOUNT
+                     + "/"
+                     + ELEMENT_ID
+                     + "/"
+                     + ELEMENT_OTHER
+                     + "/"
+                     + ELEMENT_ID,
+                 false);
+ 
+         // Debtor details
+         debtorBuildingNumber =
+             XMLUtil.getElementValue(
+                 root,
+                 ELEMENT_DEBTOR + "/" + ELEMENT_POSTAL_ADDRESS + "/" + ELEMENT_BUILDING_NUMBER,
+                 true);
+ 
+         debtorStreetName =
+             XMLUtil.getElementValue(
+                 root,
+                 ELEMENT_DEBTOR + "/" + ELEMENT_POSTAL_ADDRESS + "/" + ELEMENT_STREET_NAME,
+                 true);
+ 
+         if (StringUtil.isEmpty(debtorBuildingNumber) && StringUtil.isEmpty(debtorStreetName)) {
+           debtorStreetName =
+               XMLUtil.getElementValue(
+                   root,
+                   ELEMENT_DEBTOR
+                       + "/"
+                       + ELEMENT_POSTAL_ADDRESS
+                       + "/"
+                       + ELEMENT_ADDRESS_LINE
+                       + "[0]",
+                   true);
+         }
+       }
+ 
+       int paymentNumber = 0;
+ 
+       if (ELEMENT_CREDIT_TRANSFER_TRANSACTION_INFORMATION.equals(rootName)) {
+         final List<FileError> paymentErrors = new ArrayList<>();
+         paymentNumber++;
+ 
+         // Read document body data
+         myDetailRecords.set(myDetailRecords.size() - 1, myDetailRecords.lastElement() + 1);
+         mySumOfTransactions.set(
+             mySumOfTransactions.size() - 1,
+             mySumOfTransactions.lastElement()
+                 + new BigDecimal(
+                         XMLUtil.getElementValue(
+                             root, ELEMENT_AMOUNT + "/" + ELEMENT_INSTRUCTED_AMOUNT, false))
+                     .doubleValue());
+ 
+         final String chequeDeliveryMethod =
+             XMLUtil.getElementValue(
+                 root,
+                 ELEMENT_CHEQUE_INSTRUMENT + "/" + ELEMENT_DELIVERY_METHOD + "/" + ELEMENT_CODE,
+                 true);
+ 
+         chargeBearer = XMLUtil.getElementValue(root, ELEMENT_CHARGE_BEARER, true);
+ 
+         remittanceFooter =
+             XMLUtil.getElementValue(
+                 root, ELEMENT_CHEQUE_INSTRUMENT + "/" + ELEMENT_MEMO_FIELD, true);
+ 
+         remittanceLayoutCode =
+             XMLUtil.getElementValue(
+                 root, ELEMENT_CHEQUE_INSTRUMENT + "/" + ELEMENT_FORMS_CODE, true);
+ 
+         remittanceRecipientCode =
+             XMLUtil.getElementValue(
+                 root,
+                 ELEMENT_CREDITOR
+                     + "/"
+                     + ELEMENT_ID
+                     + "/"
+                     + ELEMENT_ORG_ID
+                     + "/"
+                     + ELEMENT_OTHER
+                     + "/"
+                     + ELEMENT_ID,
+                 true);
+ 
+         recipientTaxId =
+             XMLUtil.getElementValue(
+                 root, ELEMENT_TAX + "/" + ELEMENT_CREDITOR + "/" + ELEMENT_TAX_ID, true);
+ 
+         remittanceLocationMethod =
+             XMLUtil.getElementValue(
+                 root,
+                 ELEMENT_RELATED_REMITTANCE_INFORMATION + "/" + ELEMENT_REMITTANCE_LOCATION_METHOD,
+                 true);
+ 
+         returnToAddressIdentifier =
+             XMLUtil.getElementValue(
+                 root, ELEMENT_RELATED_REMITTANCE_INFORMATION + "/" + ELEMENT_REMITTANCE_ID, true);
+ 
+         if (REMITTANCE_LOCATION_METHOD_POST.equals(remittanceLocationMethod)) {
+           String country =
+               XMLUtil.getElementValue(
+                   root,
+                   ELEMENT_CREDITOR + "/" + ELEMENT_POSTAL_ADDRESS + "/" + ELEMENT_COUNTRY,
+                   true);
+           country = country == null ? AUSTRALIA_COUNTRY_CODE : country;
+           if (chequeDeliveryMethod != null
+               && Pattern.matches("MLDB|CRDB|RGDB", chequeDeliveryMethod)) {
+             remittanceType = REMITTANCE_TYPE_POST_RETURN;
+           } else if (StringUtils.startsWith(debtorBIC, "WPACNZ")
+               || country.equalsIgnoreCase(domiciled)
+               || (domiciled == null && AUSTRALIA_COUNTRY_CODE.equalsIgnoreCase(country))) {
+             remittanceType = REMITTANCE_TYPE_POST;
+           } else {
+             remittanceType = REMITTANCE_TYPE_POST_OVERSEAS;
+           }
+ 
+         } else if (REMITTANCE_LOCATION_METHOD_EMAIL.equals(remittanceLocationMethod)) {
+           remittanceType = REMITTANCE_TYPE_EMAIL;
+         } else if (REMITTANCE_LOCATION_METHOD_FAX.equals(remittanceLocationMethod)) {
+           remittanceType = REMITTANCE_TYPE_FAX;
+         } else {
+           remittanceType = REMITTANCE_TYPE_NONE;
+         }
+ 
+         final String location =
+             XMLUtil.getElementValue(root, ELEMENT_PAYMENT_ID + "/" + ELEMENT_INSTRUCTED_ID, true);
+ 
+         final String paymentReferenceElement =
+             myUsePayeeReference ? ELEMENT_END_TO_END_ID : ELEMENT_INSTRUCTED_ID;
+         final String paymentReference =
+             XMLUtil.getElementValue(
+                 root, ELEMENT_PAYMENT_ID + "/" + paymentReferenceElement, true);
+ 
+         final String paymentAmount =
+             XMLUtil.getElementValue(
+                 root, ELEMENT_AMOUNT + "/" + ELEMENT_INSTRUCTED_AMOUNT, false);
+ 
+         if (new BigDecimal(paymentAmount).compareTo(new BigDecimal(MAX_PAYMENT_AMOUNT)) > -1
+             && PaymentType.EFT.equals(paymentType)) {
+           if (!myRejectIndividualPayments) {
+             myErrors.add(
+                 "Bad Payment Amount '"
+                     + paymentAmount
+                     + "'. Must be less than "
+                     + NumberFormat.getCurrencyInstance().format(MAX_PAYMENT_AMOUNT));
+           }
+ 
+           paymentErrors.add(
+               createFileError(
+                   "Payment " + paymentNumber,
+                   "CdtTrfTxInf/Amt/InstdAmt",
+                   paymentAmount,
+                   "Q99",
+                   "",
+                   "Amount must be less than "
+                       + NumberFormat.getCurrencyInstance().format(MAX_PAYMENT_AMOUNT)));
+         }
+ 
+         String payeeName =
+             XMLUtil.getElementValue(root, ELEMENT_CREDITOR + "/" + ELEMENT_NAME, true);
+ 
+         if (myUseCreditorAccountName) {
+           payeeName =
+               XMLUtil.getElementValue(root, ELEMENT_CREDITOR_ACCOUNT + "/" + ELEMENT_NAME, true);
+         }
+ 
+         if (StringUtils.length(payeeName) > MAX_CREDITOR_NAME_LENGTH) {
+           if (!myRejectIndividualPayments) {
+             myErrors.add("Bad Payee Name '" + payeeName + "'. Must be 256 chars or less");
+           }
+ 
+           paymentErrors.add(
+               createFileError(
+                   "Payment " + paymentNumber,
+                   "CdtTrfTxInf/Cdtr/Nm",
+                   payeeName,
+                   "Q99",
+                   "",
+                   "PayeeName must be 256 chars or less."));
+         }
+ 
+         final String emailAddress =
+             XMLUtil.getElementValue(
+                 root,
+                 ELEMENT_RELATED_REMITTANCE_INFORMATION
+                     + "/"
+                     + ELEMENT_REMITTANCE_LOCATION_ELECTRONIC_ADDRESS,
+                 true);
+ 
+         final String faxNumber =
+             XMLUtil.getElementValue(
+                 root,
+                 ELEMENT_RELATED_REMITTANCE_INFORMATION
+                     + "/"
+                     + ELEMENT_REMITTANCE_LOCATION_ELECTRONIC_ADDRESS,
+                 true);
+ 
+         if (!myEnableRemittances
+             || StringUtil.isEmptyTrim(remittanceType)
+             || (REMITTANCE_TYPE_EMAIL.equals(remittanceType)
+                 && StringUtil.isEmpty(emailAddress))) {
+           remittanceType = "NONE";
+         }
+ 
+         String lodgementReference =
+             XMLUtil.getElementValue(root, ELEMENT_PAYMENT_ID + "/" + ELEMENT_END_TO_END_ID, true);
+ 
+         if (shouldTruncate(myTruncateLodgementReference)) {
+           final int truncLength;
+           switch (paymentType) {
+             case AU_OTT:
+             case NZ_OTT:
+               truncLength = OTT_TRUNCATE_LENGTH;
+               break;
+             case RTGS:
+               truncLength = RTGS_TRUNCATE_LENGTH;
+               break;
+             case EFT:
+               truncLength = DE_TRUNCATE_LENGTH;
+               break;
+             case CHEQUE:
+               truncLength = CHQ_TRUNCATE_LENGTH;
+               break;
+             case NZD_EFT:
+               truncLength = NZ_DE_TRUNCATE_LENGTH;
+               break;
+             case BPAY:
+               truncLength = BPAY_TRUNCATE_LENGTH;
+               break;
+             default:
+               truncLength = lodgementReference.length();
+           }
+ 
+           // Right align is a left truncate
+           lodgementReference =
+               StringUtil.padString(
+                       lodgementReference,
+                       truncLength,
+                       ' ',
+                       !"left".equalsIgnoreCase(myTruncateLodgementReference),
+                       true)
+                   .trim();
+         }
+ 
+         final String alternateReference =
+             XMLUtil.getElementValue(root, ELEMENT_PAYMENT_ID + "/" + ELEMENT_END_TO_END_ID, true);
+ 
+         final String recipientReference =
+             XMLUtil.getElementValue(root, ELEMENT_PAYMENT_ID + "/" + ELEMENT_END_TO_END_ID, true);
+ 
+         final String chequeNumber =
+             XMLUtil.getElementValue(
+                 root, ELEMENT_CHEQUE_INSTRUMENT + "/" + ELEMENT_CHEQUE_NUMBER, true);
+ 
+         // Check if we need to write the OTT Exchange values
+         String exchangeReference = null;
+         String exchangeInformation = null;
+         String fundingAmount = null;
+         if (PaymentType.AU_OTT.equals(paymentType) || PaymentType.NZ_OTT.equals(paymentType)) {
+           exchangeReference =
+               XMLUtil.getElementValue(
+                   root,
+                   ELEMENT_EXCHANGE_RATE_INFORMATION + "/" + ELEMENT_EXCHANGE_REFERENCE,
+                   true);
+ 
+           exchangeInformation =
+               XMLUtil.getElementValue(
+                   root, ELEMENT_EXCHANGE_RATE_INFORMATION + "/" + ELEMENT_EXCHANGE_RATE, true);
+ 
+           if (!StringUtil.isEmpty(exchangeInformation) && !StringUtil.isEmpty(paymentAmount)) {
+             final BigDecimal exchangeInformationBD = new BigDecimal(exchangeInformation);
+             BigDecimal paymentAmountBD = new BigDecimal(paymentAmount);
+             if (paymentAmountBD.scale() < MIN_PAYMENT_PRECISION) {
+               paymentAmountBD =
+                   paymentAmountBD.setScale(MIN_PAYMENT_PRECISION, RoundingMode.CEILING);
+             }
+             final BigDecimal fundingAmountBD =
+                 paymentAmountBD.divide(exchangeInformationBD, BigDecimal.ROUND_HALF_UP);
+             final DecimalFormat money = new DecimalFormat("0.00");
+             fundingAmount = money.format(fundingAmountBD.doubleValue());
+           }
+         }
+ 
+         String accountName =
+             XMLUtil.getElementValue(root, ELEMENT_CREDITOR + "/" + ELEMENT_NAME, true);
+ 
+         if (myUseCreditorAccountName) {
+           accountName =
+               XMLUtil.getElementValue(root, ELEMENT_CREDITOR_ACCOUNT + "/" + ELEMENT_NAME, true);
+         }
+         if (myUseCreditorAccountNameForNZOTT && PaymentType.NZ_OTT.equals(paymentType)) {
+           accountName =
+               XMLUtil.getElementValue(root, ELEMENT_CREDITOR_ACCOUNT + "/" + ELEMENT_NAME, true);
+           if (StringUtil.isEmptyTrim(accountName)) {
+             accountName =
+                 XMLUtil.getElementValue(root, ELEMENT_CREDITOR + "/" + ELEMENT_NAME, true);
+           }
+         }
+ 
+         String bsbNumber =
+             XMLUtil.getElementValue(
+                 root,
+                 ELEMENT_CREDITOR_AGENT
+                     + "/"
+                     + ELEMENT_CLEARING_SYSTEM_MEMBER_ID
+                     + "/"
+                     + ELEMENT_MEMBER_ID,
+                 true);
+ 
+         if (StringUtil.isEmptyTrim(bsbNumber)) {
+           bsbNumber = "";
+         }
+ 
+         if (StringUtil.isEmptyTrim(bsbNumber)
+             && (myAlwaysUseCreditAgentRoutingCode
+                 || (!AU_EFT_BSB_PATTERN.matcher(bsbNumber).matches()
+                     && !NZ_EFT_BSB_PATTERN.matcher(bsbNumber).matches()))) {
+           bsbNumber =
+               XMLUtil.getElementValue(
+                   root,
+                   ELEMENT_CREDITOR_AGENT + "/" + ELEMENT_BRANCH_ID + "/" + ELEMENT_ID,
+                   true);
+ 
+           if (StringUtil.isEmptyTrim(bsbNumber)) {
+             bsbNumber = "";
+           }
+         }
+ 
+         /**
+           * Start writing the document body Build the payment type's account information into a
+           * seperate document for streaming later. We do this because we need to obtain the buyer
+           * bsb and account to determine the buyer code for the header segment
+           */
+         final StringWriter paymentTypeWriter = new StringWriter();
+         final XMLStreamWriter paymentTypeStreamWriter =
+             myXMLOutputFactory.createXMLStreamWriter(paymentTypeWriter);
+         String accountNumber = null;
+ 
+         XMLUtil.writeElement(paymentTypeStreamWriter, "Account", null);
+ 
+         XMLUtil.writeElement(paymentTypeStreamWriter, "AccountName", accountName, false);
+ 
+         String swiftCode =
+             XMLUtil.getElementValue(
+                 root,
+                 ELEMENT_CREDITOR_AGENT
+                     + "/"
+                     + ELEMENT_FINANCIAL_INSTITUTION_ID
+                     + "/"
+                     + ELEMENT_BANK_IDENTIFIER_CODE,
+                 true);
+ 
+         if ("true".equals(parameters.get(PARAM_FORCE_CREDITOR_BIC_CODE))) {
+           XMLUtil.writeElement(paymentTypeStreamWriter, "SwiftCode", swiftCode, false);
+           swiftCode = null; // Avoid writing twice for NZ_OTT payments
+         }
+ 
+         switch (paymentType) {
+           case EFT:
+             Matcher bsbMatcher = AU_EFT_BSB_PATTERN.matcher(bsbNumber);
+             if (bsbMatcher.matches()) {
+               bsbNumber = bsbMatcher.group(1) + "-" + bsbMatcher.group(2);
+               XMLUtil.writeElement(paymentTypeStreamWriter, "BSBNumber", bsbNumber);
+             }
+ 
+             accountNumber =
+                 XMLUtil.getElementValue(
+                     root,
+                     ELEMENT_CREDITOR_ACCOUNT
+                         + "/"
+                         + ELEMENT_ID
+                         + "/"
+                         + ELEMENT_OTHER
+                         + "/"
+                         + ELEMENT_ID,
+                     true);
+             XMLUtil.writeElement(paymentTypeStreamWriter, "AccountNumber", accountNumber, false);
+             break;
+           case NZD_EFT:
+             bsbMatcher = NZ_EFT_BSB_PATTERN.matcher(bsbNumber);
+             String bankNumber = null;
+             String branchNumber = null;
+             if (bsbMatcher.matches()) {
+               bankNumber = bsbMatcher.group(1);
+               branchNumber = bsbMatcher.group(2);
+             }
+ 
+             XMLUtil.writeElement(paymentTypeStreamWriter, "BankCode", bankNumber, false);
+ 
+             XMLUtil.writeElement(paymentTypeStreamWriter, "BranchCode", branchNumber, false);
+ 
+             String fullAccountNumber =
+                 XMLUtil.getElementValue(
+                     root,
+                     ELEMENT_CREDITOR_ACCOUNT
+                         + "/"
+                         + ELEMENT_ID
+                         + "/"
+                         + ELEMENT_OTHER
+                         + "/"
+                         + ELEMENT_ID,
+                     true);
+ 
+             // we only want to modify the account number if we
+             // are setting the
+             // plugin parameter first.
+             if (myIsReformatLongNZAccountNumbers) {
+               // for domestic NZ account numbers with 10 digit
+               // account
+               // numbers
+               if (fullAccountNumber != null
+                   && fullAccountNumber.length() == 10
+                   && fullAccountNumber.charAt(7) == '0') {
+                 fullAccountNumber =
+                     fullAccountNumber.substring(0, 7) + fullAccountNumber.substring(8, 10);
+               }
+               // and with 11 digit account numbers
+               else if (fullAccountNumber != null
+                   && fullAccountNumber.length() == 11
+                   && fullAccountNumber.charAt(7) == '0'
+                   && fullAccountNumber.charAt(8) == '0') {
+                 fullAccountNumber =
+                     fullAccountNumber.substring(0, 7) + fullAccountNumber.substring(9, 11);
+               }
+             }
+             Matcher nzAccountMatcher = null;
+             accountNumber = null;
+             String nzAccountSuffix = null;
+ 
+             if (fullAccountNumber != null) {
+               nzAccountMatcher = NZ_EFT_ACCOUNT_PATTERN.matcher(fullAccountNumber);
+ 
+               if (nzAccountMatcher.matches()) {
+                 accountNumber = nzAccountMatcher.group(1);
+                 nzAccountSuffix = nzAccountMatcher.group(2);
+               } else {
+                 // Attempt to manually trim as much as we can
+                 // but leave
+                 // error in file for Payments+ to blow up on
+                 // this payment
+                 nzAccountMatcher = NZ_EFT_ACCOUNT_ERROR_PATTERN.matcher(fullAccountNumber);
+                 if (nzAccountMatcher.matches()) {
+                   accountNumber = nzAccountMatcher.group(1);
+                   nzAccountSuffix = nzAccountMatcher.group(2);
+ 
+                   // Remove leading zero
+                   if (accountNumber.charAt(0) == '0') {
+                     accountNumber = accountNumber.substring(1);
+                   }
+ 
+                   // Remove the first two leading zeroes
+                   for (int i = 0; i < 2; i++) {
+                     if (nzAccountSuffix.charAt(0) == '0') {
+                       nzAccountSuffix = nzAccountSuffix.substring(1);
+                     } else {
+                       break;
+                     }
+                   }
+                 } else {
+                   // Just display the full number, we don't
+                   // know what
+                   // format it is in
+                   accountNumber = fullAccountNumber;
+                 }
+               }
+             }
+ 
+             if (!StringUtil.isEmptyTrim(accountNumber)) {
+               XMLUtil.writeElement(paymentTypeStreamWriter, "AccountNumber", accountNumber);
+             }
+ 
+             if (!StringUtil.isEmptyTrim(nzAccountSuffix)) {
+               XMLUtil.writeElement(paymentTypeStreamWriter, "AccountSuffix", nzAccountSuffix);
+             }
+ 
+             break;
+           case CHEQUE:
+             // Do nothing
+             break;
+           case BPAY:
+             String billerNumber =
+                 XMLUtil.getElementValue(
+                     root,
+                     ELEMENT_CREDITOR_AGENT
+                         + "/"
+                         + ELEMENT_CLEARING_SYSTEM_MEMBER_ID
+                         + "/"
+                         + ELEMENT_MEMBER_ID,
+                     true);
+ 
+             if (StringUtil.isEmptyTrim(billerNumber)) {
+               billerNumber =
+                   XMLUtil.getElementValue(
+                       root,
+                       ELEMENT_CREDITOR_AGENT + "/" + ELEMENT_BRANCH_ID + "/" + ELEMENT_ID,
+                       true);
+ 
+               if (StringUtil.isEmptyTrim(billerNumber)) {
+                 billerNumber = "";
+               }
+             }
+ 
+             if (!StringUtil.isEmpty(billerNumber)) {
+               if (!(billerNumber.length() <= 10)) {
+                 if (!myRejectIndividualPayments) {
+                   myErrors.add(
+                       "Bad Biller Number '" + billerNumber + "'. Must be 10 digits or less.");
+                 }
+ 
+                 paymentErrors.add(
+                     createFileError(
+                         "Payment " + paymentNumber,
+                         "CdtTrfTxInf/CdtrAgt/ClrSysMmbId/MmbId",
+                         billerNumber,
+                         "Q99",
+                         "",
+                         "Biller Number must be 10 digits or less."));
+               }
+               if (!NumberUtils.isDigits(billerNumber)) {
+                 if (!myRejectIndividualPayments) {
+                   myErrors.add("Bad Biller Number '" + billerNumber + "'. Must be numeric.");
+                 }
+ 
+                 paymentErrors.add(
+                     createFileError(
+                         "Payment " + paymentNumber,
+                         "CdtTrfTxInf/CdtrAgt/ClrSysMmbId/MmbId",
+                         billerNumber,
+                         "Q99",
+                         "",
+                         "Biller Number must be numeric."));
+               }
+               XMLUtil.writeElement(paymentTypeStreamWriter, "BillerNumber", billerNumber);
+             }
+ 
+             final String customerReferenceNumber =
+                 XMLUtil.getElementValue(
+                     root,
+                     ELEMENT_CREDITOR_ACCOUNT
+                         + "/"
+                         + ELEMENT_ID
+                         + "/"
+                         + ELEMENT_OTHER
+                         + "/"
+                         + ELEMENT_ID,
+                     true);
+             if (!StringUtil.isEmpty(customerReferenceNumber)) {
+               if (!(customerReferenceNumber.length() <= 20)) {
+                 if (!myRejectIndividualPayments) {
+                   myErrors.add(
+                       "Bad Customer Reference Number '"
+                           + customerReferenceNumber
+                           + "'. Must be 20 digits or less.");
+                 }
+ 
+                 paymentErrors.add(
+                     createFileError(
+                         "Payment " + paymentNumber,
+                         "CdtTrfTxInf/CdtrAcct/Id/Othr/Id",
+                         customerReferenceNumber,
+                         "Q99",
+                         "",
+                         "Customer Reference Number must be 20 digits or less."));
+               }
+               if (!NumberUtils.isDigits(customerReferenceNumber)) {
+                 if (!myRejectIndividualPayments) {
+                   myErrors.add(
+                       "Bad Customer Reference Number '"
+                           + customerReferenceNumber
+                           + "'. Must be numeric.");
+                 }
+ 
+                 paymentErrors.add(
+                     createFileError(
+                         "Payment " + paymentNumber,
+                         "CdtTrfTxInf/CdtrAcct/Id/Othr/Id",
+                         customerReferenceNumber,
+                         "Q99",
+                         "",
+                         "Customer Reference Number must be numeric."));
+               }
+               XMLUtil.writeElement(
+                   paymentTypeStreamWriter, "CustomerReferenceNumber", customerReferenceNumber);
+             }
+             break;
+           case RTGS:
+             if (!StringUtil.isEmpty(bsbNumber)
+                 && bsbNumber.length() != 6
+                 && bsbNumber.length() != 7) {
+               if (!myRejectIndividualPayments) {
+                 myErrors.add("Bad bsb number '" + bsbNumber + "'. Must be 6 digits.");
+               }
+ 
+               paymentErrors.add(
+                   createFileError(
+                       "Payment " + paymentNumber,
+                       "CdtTrfTxInf/CdtrAgt/FinInstnId/ClrSysMmbId/MmbId",
+                       bsbNumber,
+                       "Q99",
+                       "",
+                       "BSB number must be 6 digits."));
+             } else if (!StringUtil.isEmpty(bsbNumber)) {
+               if (!bsbNumber.contains("-")) {
+                 bsbNumber = bsbNumber.substring(0, 3) + "-" + bsbNumber.substring(3, 6);
+               }
+               XMLUtil.writeElement(paymentTypeStreamWriter, "BSBNumber", bsbNumber);
+             }
+ 
+             accountNumber =
+                 XMLUtil.getElementValue(
+                     root,
+                     ELEMENT_CREDITOR_ACCOUNT
+                         + "/"
+                         + ELEMENT_ID
+                         + "/"
+                         + ELEMENT_OTHER
+                         + "/"
+                         + ELEMENT_ID,
+                     true);
+             if (!StringUtil.isEmpty(accountNumber)) {
+               XMLUtil.writeElement(paymentTypeStreamWriter, "AccountNumber", accountNumber);
+             }
+             break;
+           case AU_OTT:
+           case NZ_OTT:
+             final String intermediarySwiftCode =
+                 XMLUtil.getElementValue(
+                     root,
+                     ELEMENT_INTERMEDIARY_AGENT
+                         + "/"
+                         + ELEMENT_FINANCIAL_INSTITUTION_ID
+                         + "/"
+                         + ELEMENT_BANK_IDENTIFIER_CODE,
+                     true);
+ 
+             XMLUtil.writeElement(
+                 paymentTypeStreamWriter, "IntermediarySwiftCode", intermediarySwiftCode, false);
+ 
+             XMLUtil.writeElement(paymentTypeStreamWriter, "SwiftCode", swiftCode, false);
+ 
+             accountNumber =
+                 XMLUtil.getElementValue(
+                     root,
+                     ELEMENT_CREDITOR_ACCOUNT
+                         + "/"
+                         + ELEMENT_ID
+                         + "/"
+                         + ELEMENT_OTHER
+                         + "/"
+                         + ELEMENT_ID,
+                     true);
+ 
+             if (!StringUtil.isEmptyTrim(accountNumber)) {
+               if (!StringUtil.isEmptyTrim(bsbNumber)) {
+                 bsbNumber.replaceAll("-", "");
+                 accountNumber = bsbNumber + accountNumber;
+               }
+             } else {
+               accountNumber =
+                   XMLUtil.getElementValue(
+                       root,
+                       ELEMENT_CREDITOR_ACCOUNT + "/" + ELEMENT_ID + "/" + ELEMENT_IBAN,
+                       true);
+             }
+             if (!StringUtil.isEmptyTrim(accountNumber)) {
+               XMLUtil.writeElement(paymentTypeStreamWriter, "AccountNumber", accountNumber);
+             }
+             break;
+           case AU_ACH_EFT:
+           case NZ_ACH_EFT:
+             bsbMatcher = AU_EFT_BSB_PATTERN.matcher(bsbNumber);
+             if (bsbMatcher.matches()) {
+               bsbNumber = bsbMatcher.group(1) + "-" + bsbMatcher.group(2);
+               XMLUtil.writeElement(paymentTypeStreamWriter, "BSBNumber", bsbNumber);
+             }
+ 
+             final String routingCode = bsbNumber;
+             if (!StringUtil.isEmpty(routingCode)) {
+               XMLUtil.writeElement(paymentTypeStreamWriter, "RoutingCode", routingCode);
+             }
+ 
+             accountNumber =
+                 XMLUtil.getElementValue(
+                     root,
+                     ELEMENT_CREDITOR_ACCOUNT
+                         + "/"
+                         + ELEMENT_ID
+                         + "/"
+                         + ELEMENT_PROPRIETARY_ACCOUNT
+                         + "/"
+                         + ELEMENT_ID,
+                     true);
+ 
+             if (accountNumber != null) {
+               final Matcher achAccountMatcher = NZ_EFT_ACCOUNT_PATTERN.matcher(accountNumber);
+               accountNumber = null;
+               String achAccountSuffix = null;
+ 
+               if (achAccountMatcher.matches()) {
+                 accountNumber = achAccountMatcher.group(1);
+                 achAccountSuffix = achAccountMatcher.group(2);
+               }
+             }
+ 
+             if (accountNumber == null) {
+               accountNumber =
+                   XMLUtil.getElementValue(
+                       root,
+                       ELEMENT_CREDITOR_ACCOUNT + "/" + ELEMENT_ID + "/" + ELEMENT_IBAN,
+                       true);
+             }
+ 
+             if (!StringUtil.isEmptyTrim(accountNumber)) {
+               XMLUtil.writeElement(paymentTypeStreamWriter, "AccountNumber", accountNumber);
+             }
+ 
+             break;
+           case OSKO:
+             String schemeName =
+                 XMLUtil.getElementValue(
+                     root,
+                     ELEMENT_CREDITOR_ACCOUNT
+                         + "/"
+                         + ELEMENT_ID
+                         + "/"
+                         + ELEMENT_OTHER
+                         + "/"
+                         + ELEMENT_SCHEME_NAME
+                         + "/"
+                         + ELEMENT_CODE,
+                     true);
+ 
+             String accountIdentifier = null;
+ 
+             if (schemeName.equals(OSKO_SCHEME_NAME_EMAL)) {
+               accountIdentifier =
+                   XMLUtil.getElementValue(
+                       root,
+                       ELEMENT_CREDITOR
+                           + "/"
+                           + ELEMENT_CONTACT_DETAILS
+                           + "/"
+                           + ELEMENT_EMAIL_ADDRESS,
+                       true);
+             } else if (schemeName.equals(OSKO_SCHEME_NAME_ORGN)) {
+               accountIdentifier =
+                   XMLUtil.getElementValue(
+                       root,
+                       ELEMENT_CREDITOR + "/" + ELEMENT_CONTACT_DETAILS + "/" + ELEMENT_NAME,
+                       true);
+             } else {
+               accountIdentifier =
+                   XMLUtil.getElementValue(
+                       root,
+                       ELEMENT_CREDITOR_ACCOUNT
+                           + "/"
+                           + ELEMENT_ID
+                           + "/"
+                           + ELEMENT_OTHER
+                           + "/"
+                           + ELEMENT_ID,
+                       true);
+             }
+ 
+             if (!StringUtil.isEmptyTrim(accountIdentifier)) {
+               XMLUtil.writeElement(
+                   paymentTypeStreamWriter, "AccountIdentifier", accountIdentifier);
+             }
+ 
+             if (!StringUtil.isEmptyTrim(schemeName)) {
+               XMLUtil.writeElement(paymentTypeStreamWriter, "AccountSchemeName", schemeName);
+             }
+ 
+             break;
+ 
+           case PAYANYONE:
+             schemeName =
+                 XMLUtil.getElementValue(
+                     root,
+                     ELEMENT_CREDITOR_ACCOUNT
+                         + "/"
+                         + ELEMENT_ID
+                         + "/"
+                         + ELEMENT_OTHER
+                         + "/"
+                         + ELEMENT_SCHEME_NAME
+                         + "/"
+                         + ELEMENT_CODE,
+                     true);
+ 
+             accountIdentifier =
+                 XMLUtil.getElementValue(
+                     root,
+                     ELEMENT_CREDITOR_ACCOUNT
+                         + "/"
+                         + ELEMENT_ID
+                         + "/"
+                         + ELEMENT_OTHER
+                         + "/"
+                         + ELEMENT_ID,
+                     true);
+ 
+             if (!StringUtil.isEmptyTrim(accountIdentifier)) {
+               XMLUtil.writeElement(
+                   paymentTypeStreamWriter, "AccountIdentifier", accountIdentifier);
+             }
+ 
+             if (!StringUtil.isEmptyTrim(schemeName)) {
+               XMLUtil.writeElement(paymentTypeStreamWriter, "AccountSchemeName", schemeName);
+             }
+ 
+             break;
+         }
+ 
+         // need to close a tag here
+         XMLUtil.writeEndElement(paymentTypeStreamWriter);
+ 
+         // Buyer Account details
+         if (CURRENCY_CODE_NEW_ZEALAND.equals(debtorCurrency)) {
+           XMLUtil.writeElement(paymentTypeStreamWriter, "BuyerAccount", null);
+           final Matcher bsbMatcher = NZ_EFT_BSB_PATTERN.matcher(debtorAgentMemberId);
+           String bankNumber = null;
+           String branchNumber = null;
+           if (bsbMatcher.matches()) {
+             bankNumber = bsbMatcher.group(1);
+             branchNumber = bsbMatcher.group(2);
+           }
+ 
+           if (!StringUtil.isEmpty(bankNumber)) {
+             XMLUtil.writeElement(paymentTypeStreamWriter, "BankCode", bankNumber);
+           }
+ 
+           if (!StringUtil.isEmpty(bankNumber)) {
+             XMLUtil.writeElement(paymentTypeStreamWriter, "BranchCode", branchNumber);
+           }
+ 
+           Matcher accountMatcher = NZ_EFT_ACCOUNT_PATTERN.matcher(debtorAgentAccountId);
+           String accountSuffix = null;
+ 
+           if (accountMatcher.matches()) {
+             accountNumber = accountMatcher.group(1);
+             accountSuffix = accountMatcher.group(2);
+           } else {
+             // Attempt to manually trim as much as we can but
+             // leave
+             // error in file for Payments+ to blow up on this
+             // payment
+             accountMatcher = NZ_EFT_ACCOUNT_ERROR_PATTERN.matcher(debtorAgentAccountId);
+             if (accountMatcher.matches()) {
+               accountNumber = accountMatcher.group(1);
+               accountSuffix = accountMatcher.group(2);
+ 
+               // Remove leading zero
+               if (accountNumber.charAt(0) == '0') {
+                 accountNumber = accountNumber.substring(1);
+               }
+ 
+               // Remove the first two leading zeroes
+               for (int i = 0; i < 2; i++) {
+                 if (accountSuffix.charAt(0) == '0') {
+                   accountSuffix = accountSuffix.substring(1);
+                 } else {
+                   break;
+                 }
+               }
+             } else {
+               // Just display the full number, we don't know
+               // what
+               // format it is in
+               accountNumber = debtorAgentAccountId;
+             }
+           }
+ 
+           if (!StringUtil.isEmptyTrim(accountNumber)) {
+             if (isFCA) {
+               XMLUtil.writeElement(
+                   paymentTypeStreamWriter, "ForeignCurrencyAccountNumber", accountNumber);
+             } else {
+               XMLUtil.writeElement(paymentTypeStreamWriter, "AccountNumber", accountNumber);
+             }
+           }
+ 
+           if (!StringUtil.isEmptyTrim(accountSuffix)) {
+             XMLUtil.writeElement(paymentTypeStreamWriter, "AccountSuffix", accountSuffix);
+           }
+           XMLUtil.writeEndElement(paymentTypeStreamWriter);
+         } else if (CURRENCY_CODE_AUSTRALIA.equals(debtorCurrency)) {
+           // Ensure the hyphen is between the first and last 3
+           // digits of the bsb
+           final Matcher debtorMatcher = AU_EFT_BSB_PATTERN.matcher(debtorAgentMemberId);
+           if (debtorMatcher.matches()) {
+             debtorAgentMemberId = debtorMatcher.group(1) + "-" + debtorMatcher.group(2);
+           }
+ 
+           XMLUtil.writeElement(paymentTypeStreamWriter, "BuyerAccount", null);
+           XMLUtil.writeElement(paymentTypeStreamWriter, "BSBNumber", debtorAgentMemberId, false);
+           if (isFCA) {
+             XMLUtil.writeElement(
+                 paymentTypeStreamWriter, "ForeignCurrencyAccountNumber", debtorAgentAccountId);
+           } else {
+             XMLUtil.writeElement(paymentTypeStreamWriter, "AccountNumber", debtorAgentAccountId);
+           }
+           XMLUtil.writeEndElement(paymentTypeStreamWriter);
+         }
+ 
+         // Writer the header segment
+         myBuyerCode =
+             parameters.get(
+                 PARAM_BUYER_CODE + "_" + debtorAgentMemberId + "_" + debtorAgentAccountId);
+ 
+         if (StringUtil.isEmptyTrim(myBuyerCode)) {
+           myBuyerCode = parameters.get(PARAM_BUYER_CODE);
+ 
+           // If we don't have a parameter, check if we have one from an uploaded
+           // file.
+           if (StringUtil.isEmptyTrim(myBuyerCode)) {
+             myBuyerCode = message.getParameter("BuyerCode");
+           }
+         } else {
+           myIsSpecificBuyerCodeUsed = true;
+         }
+ 
+         if (StringUtil.isEmptyTrim(myBuyerCode)) {
+           myErrors.add(
+               "No specific buyer code could be "
+                   + "identified and no default was given in the parameters."
+                   + "BSB '"
+                   + debtorAgentMemberId
+                   + "', Account '"
+                   + debtorAgentAccountId
+                   + "'");
+ 
+           hasBuyerCodeError = true;
+         }
+ 
+         // Write an empty parent file here if we need to
+         if (!hasWrittenEmptyParent && needsParentPayablesFile) {
+           createEmptyParentMessage(
+               ppimBuilder,
+               message,
+               paymentDate,
+               fileReference,
+               fileName,
+               payablesFileId,
+               grpHdrPayLoad,
+               pmtInfXML);
+           hasWrittenEmptyParent = true;
+         }
+ 
+         if (!isHeaderWritten) {
+           ppimBuilder.writeHeaderSegment(
+               writer,
+               curWriter,
+               myBuyerCode,
+               paymentDate,
+               fileChargeBearer,
+               myTokenizeSettlementReference,
+               fileReference,
+               fileName,
+               grpHdrPayLoad,
+               pmtInfXML,
+               payablesFileId,
+               needsParentPayablesFile,
+               false,
+               mySkipDuplicateFileChecks,
+               myFileErrors);
+           isHeaderWritten = true;
+         }
+ 
+         // Write the rest of our body document
+         XMLUtil.writeElement(curWriter, "Payment", null);
+ 
+         XMLUtil.writeElement(curWriter, "Location", location, false);
+ 
+         // Omit if > 35 characters
+         if (StringUtils.length(paymentReference) <= 35) {
+           XMLUtil.writeElement(curWriter, "PaymentReference", paymentReference, false);
+         }
+ 
+         XMLUtil.writeElement(
+             curWriter,
+             "PaymentAmount",
+             paymentAmount,
+             "Currency",
+             XMLUtil.getElementAttributeValue(
+                 root,
+                 ELEMENT_AMOUNT + "/" + ELEMENT_INSTRUCTED_AMOUNT,
+                 ATTRIBUTE_CURRENCY,
+                 true));
+ 
+         XMLUtil.writeElement(curWriter, "PayeeName", payeeName, false);
+ 
+         XMLUtil.writeElement(curWriter, "RemittanceType", remittanceType, false);
+ 
+         XMLUtil.writeElement(curWriter, "RemittanceSubType", remittanceLayoutCode, false);
+ 
+         if (PAYROLL_CATEGORY_PURPOSE_CODE.equalsIgnoreCase(categoryPurposeCode)) {
+           XMLUtil.writeElement(curWriter, "Purpose", "PAYROLL");
+         }
+ 
+         XMLUtil.writePotentiallyBlankElement(
+             curWriter,
+             "PaymentType",
+             PaymentType.UNKNOWN.equals(paymentType) ? "" : paymentType.name());
+ 
+         XMLUtil.writeElement(curWriter, "LodgementReference", lodgementReference, false);
+ 
+         XMLUtil.writeElement(curWriter, "AlternateReference", alternateReference, false);
+ 
+         XMLUtil.writeElement(curWriter, "RecipientReference", recipientReference, false);
+ 
+         XMLUtil.writeElement(curWriter, "ChequeNumber", chequeNumber, false);
+ 
+         // Write the OTT Exchange values if necessary
+         if (PaymentType.AU_OTT.equals(paymentType) || PaymentType.NZ_OTT.equals(paymentType)) {
+           XMLUtil.writeElement(curWriter, "ExchangeReference", exchangeReference, false);
+ 
+           XMLUtil.writeElement(
+               curWriter, "ExchangeRate", StringUtil.trim(exchangeInformation), false);
+ 
+           String debtorCurrencyToUse = debtorCurrency;
+           if (myForceDebtorAccountCurrencyForExchange && StringUtils.isNotBlank(debtorAcctCcy)) {
+             debtorCurrencyToUse = debtorAcctCcy;
+           }
+           XMLUtil.writeElement(
+               curWriter,
+               "FundingAmount",
+               fundingAmount,
+               ATTRIBUTE_CURRENCY_FULL,
+               debtorCurrencyToUse,
+               false);
+         }
+ 
+         XMLUtil.writeElement(curWriter, "ChargeBearer", chargeBearer, false);
+ 
+         // Write our payment type account information.
+         curWriter.flush();
+ 
+         paymentTypeStreamWriter.flush();
+         writer.write(paymentTypeWriter.toString());
+ 
+         // We only extract and include the remitter address from the ultimate
+         // debtor if this is true. It defaults true, but we explicitly set others
+         // to false.
+         if (myIncludeUltimateDebtor || PaymentType.OSKO.equals(paymentType)) {
+           // Write the remitter address from UltDbtr
+           XMLUtil.writeElement(curWriter, "RemitterAddress", null);
+ 
+           XMLUtil.writeElement(
+               curWriter,
+               "AddresseeName",
+               XMLUtil.getElementValue(root, ELEMENT_ULTIMATE_DEBTOR + "/" + ELEMENT_NAME, true),
+               false);
+ 
+           final String remitterBuildingNumber =
+               XMLUtil.getElementValue(
+                   root,
+                   ELEMENT_ULTIMATE_DEBTOR
+                       + "/"
+                       + ELEMENT_POSTAL_ADDRESS
+                       + "/"
+                       + ELEMENT_BUILDING_NUMBER,
+                   true);
+ 
+           String remitterStreetName =
+               XMLUtil.getElementValue(
+                   root,
+                   ELEMENT_ULTIMATE_DEBTOR
+                       + "/"
+                       + ELEMENT_POSTAL_ADDRESS
+                       + "/"
+                       + ELEMENT_STREET_NAME,
+                   true);
+ 
+           String remitterStreet2 = null;
+ 
+           if (StringUtil.isEmpty(remitterBuildingNumber)
+               && StringUtil.isEmpty(remitterStreetName)) {
+ 
+             remitterStreetName =
+                 XMLUtil.getElementValue(
+                     root,
+                     ELEMENT_ULTIMATE_DEBTOR
+                         + "/"
+                         + ELEMENT_POSTAL_ADDRESS
+                         + "/"
+                         + ELEMENT_ADDRESS_LINE,
+                     true);
+ 
+             remitterStreetName =
+                 XMLUtil.getElementValue(
+                     root,
+                     ELEMENT_ULTIMATE_DEBTOR
+                         + "/"
+                         + ELEMENT_POSTAL_ADDRESS
+                         + "/"
+                         + ELEMENT_ADDRESS_LINE
+                         + "[0]",
+                     true);
+ 
+             remitterStreet2 =
+                 XMLUtil.getElementValue(
+                     root,
+                     ELEMENT_ULTIMATE_DEBTOR
+                         + "/"
+                         + ELEMENT_POSTAL_ADDRESS
+                         + "/"
+                         + ELEMENT_ADDRESS_LINE
+                         + "[1]",
+                     true);
+           }
+ 
+           if (!StringUtil.isEmpty(remitterBuildingNumber)
+               || !StringUtil.isEmpty(remitterStreetName)) {
+             XMLUtil.writeElement(
+                 curWriter,
+                 "Street1",
+                 (!StringUtil.isEmpty(remitterBuildingNumber) ? remitterBuildingNumber + " " : "")
+                     + (!StringUtil.isEmpty(remitterStreetName) ? remitterStreetName : ""));
+             if (!StringUtil.isEmpty(remitterStreet2)) {
+               XMLUtil.writeElement(curWriter, "Street2", remitterStreet2);
+             }
+           }
+ 
+           final String remitterCity =
+               XMLUtil.getElementValue(
+                   root,
+                   ELEMENT_ULTIMATE_DEBTOR
+                       + "/"
+                       + ELEMENT_POSTAL_ADDRESS
+                       + "/"
+                       + ELEMENT_TOWN_NAME,
+                   true);
+           if (!StringUtil.isEmpty(remitterCity)) {
+             XMLUtil.writeElement(curWriter, "City", remitterCity);
+           }
+ 
+           final String remitterState =
+               XMLUtil.getElementValue(
+                   root,
+                   ELEMENT_ULTIMATE_DEBTOR
+                       + "/"
+                       + ELEMENT_POSTAL_ADDRESS
+                       + "/"
+                       + ELEMENT_COUNTRY_SUB_DIVISION,
+                   true);
+           if (!StringUtil.isEmpty(remitterState)) {
+             XMLUtil.writeElement(curWriter, "State", remitterState);
+           }
+ 
+           final String remitterCountry =
+               XMLUtil.getElementValue(
+                   root,
+                   ELEMENT_ULTIMATE_DEBTOR + "/" + ELEMENT_POSTAL_ADDRESS + "/" + ELEMENT_COUNTRY,
+                   true);
+           if (!StringUtil.isEmpty(remitterCountry)) {
+             XMLUtil.writeElement(curWriter, "CountryCode", remitterCountry);
+           }
+ 
+           final String remitterPostCode =
+               XMLUtil.getElementValue(
+                   root,
+                   ELEMENT_ULTIMATE_DEBTOR
+                       + "/"
+                       + ELEMENT_POSTAL_ADDRESS
+                       + "/"
+                       + ELEMENT_POST_CODE,
+                   true);
+           if (!StringUtil.isEmpty(remitterPostCode)) {
+             XMLUtil.writeElement(curWriter, "PostCode", remitterPostCode);
+           }
+ 
+           XMLUtil.writeEndElement(curWriter); // Close RemitterAddress
+ 
+           // Alongside the remitter address is the remitter account.
+           // If this is included, and the includeRemitterAddress
+           // parameter is true, and the scheme name priority is OTHERACCT
+           // we'll include this also.
+ 
+           if ("OTHRACCT"
+               .equals(
+                   XMLUtil.getElementValue(
+                       root,
+                       ELEMENT_ULTIMATE_DEBTOR
+                           + "/"
+                           + ELEMENT_ID
+                           + "/"
+                           + ELEMENT_PRIVATE_ID
+                           + "/"
+                           + ELEMENT_SCHEME_NAME
+                           + "/"
+                           + ELEMENT_PROPRIETARY,
+                       true))) {
+ 
+             final String remitterAccount =
+                 XMLUtil.getElementValue(
+                     root,
+                     ELEMENT_ULTIMATE_DEBTOR
+                         + "/"
+                         + ELEMENT_ID
+                         + "/"
+                         + ELEMENT_PRIVATE_ID
+                         + "/"
+                         + ELEMENT_OTHER
+                         + "/"
+                         + ELEMENT_ID,
+                     true);
+ 
+             if (!StringUtil.isEmptyTrim(remitterAccount)) {
+               XMLUtil.writeElement(curWriter, "RemitterAccount", remitterAccount);
+             }
+           }
+         }
+ 
+         // Debtor Details
+         XMLUtil.writeElement(curWriter, "PayeeRegisteredAddress", null);
+ 
+         String addresseeName = "";
+         if (myUseCreditorAccountName) {
+           addresseeName =
+               XMLUtil.getElementValue(root, ELEMENT_CREDITOR_ACCOUNT + "/" + ELEMENT_NAME);
+         } else {
+           addresseeName = XMLUtil.getElementValue(root, ELEMENT_CREDITOR + "/" + ELEMENT_NAME);
+         }
+ 
+         XMLUtil.writeElement(curWriter, "AddresseeName", addresseeName, false);
+ 
+         final String buildingNumber =
+             XMLUtil.getElementValue(
+                 root,
+                 ELEMENT_CREDITOR + "/" + ELEMENT_POSTAL_ADDRESS + "/" + ELEMENT_BUILDING_NUMBER,
+                 true);
+ 
+         String streetName =
+             XMLUtil.getElementValue(
+                 root,
+                 ELEMENT_CREDITOR + "/" + ELEMENT_POSTAL_ADDRESS + "/" + ELEMENT_STREET_NAME,
+                 true);
+ 
+         String street2 = null;
+         String street3 = null;
+ 
+         if (StringUtil.isEmpty(buildingNumber) && StringUtil.isEmpty(streetName)) {
+           streetName =
+               XMLUtil.getElementValue(
+                   root,
+                   ELEMENT_CREDITOR + "/" + ELEMENT_POSTAL_ADDRESS + "/" + ELEMENT_ADDRESS_LINE,
+                   true);
+ 
+           streetName =
+               XMLUtil.getElementValue(
+                   root,
+                   ELEMENT_CREDITOR
+                       + "/"
+                       + ELEMENT_POSTAL_ADDRESS
+                       + "/"
+                       + ELEMENT_ADDRESS_LINE
+                       + "[0]",
+                   true);
+ 
+           street2 =
+               XMLUtil.getElementValue(
+                   root,
+                   ELEMENT_CREDITOR
+                       + "/"
+                       + ELEMENT_POSTAL_ADDRESS
+                       + "/"
+                       + ELEMENT_ADDRESS_LINE
+                       + "[1]",
+                   true);
+ 
+           street3 =
+               XMLUtil.getElementValue(
+                   root,
+                   ELEMENT_CREDITOR
+                       + "/"
+                       + ELEMENT_POSTAL_ADDRESS
+                       + "/"
+                       + ELEMENT_ADDRESS_LINE
+                       + "[2]",
+                   true);
+         }
+ 
+         if (!StringUtil.isEmpty(buildingNumber) || !StringUtil.isEmpty(streetName)) {
+           XMLUtil.writeElement(
+               curWriter,
+               "Street1",
+               (!StringUtil.isEmpty(buildingNumber) ? buildingNumber + " " : "")
+                   + (!StringUtil.isEmpty(streetName) ? streetName : ""));
+           if (!StringUtil.isEmpty(street2)) {
+             XMLUtil.writeElement(curWriter, "Street2", street2);
+           }
+           if (!StringUtil.isEmpty(street3)) {
+             XMLUtil.writeElement(curWriter, "Street3", street3);
+           }
+         }
+ 
+         final String city =
+             XMLUtil.getElementValue(
+                 root,
+                 ELEMENT_CREDITOR + "/" + ELEMENT_POSTAL_ADDRESS + "/" + ELEMENT_TOWN_NAME,
+                 true);
+         if (!StringUtil.isEmpty(city)) {
+           XMLUtil.writeElement(curWriter, "City", city);
+         }
+ 
+         final String state =
+             XMLUtil.getElementValue(
+                 root,
+                 ELEMENT_CREDITOR
+                     + "/"
+                     + ELEMENT_POSTAL_ADDRESS
+                     + "/"
+                     + ELEMENT_COUNTRY_SUB_DIVISION,
+                 true);
+         if (!StringUtil.isEmpty(state)) {
+           XMLUtil.writeElement(curWriter, "State", state);
+         }
+ 
+         final String country =
+             XMLUtil.getElementValue(
+                 root,
+                 ELEMENT_CREDITOR + "/" + ELEMENT_POSTAL_ADDRESS + "/" + ELEMENT_COUNTRY,
+                 true);
+         if (!StringUtil.isEmpty(country)) {
+           XMLUtil.writeElement(curWriter, "CountryCode", country);
+         }
+ 
+         final String postCode =
+             XMLUtil.getElementValue(
+                 root,
+                 ELEMENT_CREDITOR + "/" + ELEMENT_POSTAL_ADDRESS + "/" + ELEMENT_POST_CODE,
+                 true);
+         if (!StringUtil.isEmpty(postCode)) {
+           XMLUtil.writeElement(curWriter, "PostCode", postCode);
+         }
+ 
+         if (REMITTANCE_LOCATION_METHOD_EMAIL.equals(remittanceLocationMethod)
+             && !StringUtil.isEmpty(emailAddress)) {
+           XMLUtil.writeElement(curWriter, "EmailAddress", emailAddress);
+         }
+ 
+         if (REMITTANCE_LOCATION_METHOD_FAX.equals(remittanceLocationMethod)
+             && !StringUtil.isEmpty(faxNumber)) {
+           XMLUtil.writeElement(curWriter, "FaxNumber", faxNumber);
+         }
+         XMLUtil.writeEndElement(curWriter); // Close PayeeRegisteredAddress
+ 
+         // Creditor Details
+         XMLUtil.writeElement(curWriter, "Address", null);
+         XMLUtil.writeElement(curWriter, "AddresseeName", addresseeName);
+ 
+         if (!StringUtil.isEmpty(buildingNumber) || !StringUtil.isEmpty(streetName)) {
+           XMLUtil.writeElement(
+               curWriter,
+               "Street1",
+               (!StringUtil.isEmpty(buildingNumber) ? buildingNumber + " " : "")
+                   + (!StringUtil.isEmpty(streetName) ? streetName : ""));
+           if (!StringUtil.isEmpty(street2)) {
+             XMLUtil.writeElement(curWriter, "Street2", street2);
+           }
+           if (!StringUtil.isEmpty(street3)) {
+             XMLUtil.writeElement(curWriter, "Street3", street3);
+           }
+         }
+ 
+         if (!StringUtil.isEmpty(city)) {
+           XMLUtil.writeElement(curWriter, "City", city);
+         }
+ 
+         if (!StringUtil.isEmpty(state)) {
+           XMLUtil.writeElement(curWriter, "State", state);
+         }
+ 
+         if (!StringUtil.isEmpty(country)) {
+           XMLUtil.writeElement(curWriter, "CountryCode", country);
+         }
+ 
+         if (!StringUtil.isEmpty(postCode)) {
+           XMLUtil.writeElement(curWriter, "PostCode", postCode);
+         }
+ 
+         if (REMITTANCE_LOCATION_METHOD_EMAIL.equals(remittanceLocationMethod)
+             && !StringUtil.isEmpty(emailAddress)) {
+           XMLUtil.writeElement(curWriter, "EmailAddress", emailAddress);
+         }
+ 
+         if (REMITTANCE_LOCATION_METHOD_FAX.equals(remittanceLocationMethod)
+             && !StringUtil.isEmpty(faxNumber)) {
+           XMLUtil.writeElement(curWriter, "FaxNumber", faxNumber);
+         }
+         XMLUtil.writeEndElement(curWriter); // Close Address
+ 
+         XMLUtil.writeElement(curWriter, "RemittancePayload", null);
+         XMLUtil.writeElement(curWriter, ELEMENT_CREDIT_TRANSFER_TRANSACTION_INFORMATION, null);
+         curWriter.writeCharacters("");
+ 
+         for (final XMLElement child : root.getAllChildren()) {
+           // Copy the child into the RemittancePayload
+           curWriter.writeCharacters("\r\n");
+           writePayloadChunk(child, writer);
+         }
+ 
+         // Read each Ustrd and Strd child, extract required
+         // information and write element into RemittancePayload
+ 
+         final List<String> unstructured = new ArrayList<>();
+         final List<StructuredRemittanceElement> structured = new ArrayList<>();
+         boolean isRmtInfOpen = false;
+ 
+         Document remittanceItem;
+         final String[] remittanceItemNames = {ELEMENT_UNSTRUCTURED, ELEMENT_STRUCTURED};
+         final String searchHierarchy =
+             ELEMENT_DOCUMENT
+                 + "/"
+                 + ELEMENT_PAIN
+                 + "/"
+                 + ELEMENT_PAYMENT_INFORMATION
+                 + "/"
+                 + ELEMENT_CREDIT_TRANSFER_TRANSACTION_INFORMATION;
+ 
+         int structuredElementCount = 0;
+         int payloadSize = 0;
+ 
+         String oskoRemittanceType1 = null;
+         String oskoRemittanceType2 = null;
+         String nzParticulars = null;
+         String nzAnalysis = null;
+         String nzReference = null;
+         final List<String> tag70RemittanceInformationData = new ArrayList<>();
+         while ((remittanceItem =
+                 dom.getDocumentExcerpt(remittanceItemNames, remittanceItemNames, searchHierarchy))
+             != null) {
+           final XMLElement remittanceRoot = new XMLDocument(remittanceItem).getDocumentElement();
+ 
+           if (!isRmtInfOpen) {
+             XMLUtil.writeElement(curWriter, ELEMENT_REMITTANCE_INFO, null);
+             isRmtInfOpen = true;
+           }
+ 
+           if (ELEMENT_UNSTRUCTURED.equals(remittanceRoot.getLocalName())) {
+             if ((PaymentType.OSKO.equals(paymentType)
+                     || PaymentType.PAYANYONE.equals(paymentType))
+                 && StringUtils.isBlank(oskoRemittanceType1)) {
+               oskoRemittanceType1 = remittanceRoot.getValue();
+               if (oskoRemittanceType1 != null) {
+                 oskoRemittanceType1 = oskoRemittanceType1.replaceAll("[\r\n]", " ");
+               }
+             } else if ((PaymentType.OSKO.equals(paymentType)
+                     || PaymentType.PAYANYONE.equals(paymentType))
+                 && StringUtils.isBlank(oskoRemittanceType2)) {
+               oskoRemittanceType2 = remittanceRoot.getValue();
+               if (oskoRemittanceType2 != null) {
+                 oskoRemittanceType2 = oskoRemittanceType2.replaceAll("[\r\n]", " ");
+               }
+             } else {
+               unstructured.add(remittanceRoot.getValue());
+               curWriter.writeCharacters("\r\n");
+               writePayloadChunk(remittanceRoot, writer);
+             }
+ 
+             // Store Tag70 fields
+             if (PaymentType.AU_OTT.equals(paymentType)) {
+               tag70RemittanceInformationData.add(remittanceRoot.getValue());
+             }
+           } else if (ELEMENT_STRUCTURED.equals(remittanceRoot.getLocalName())) {
+             final StructuredRemittanceElement el = new StructuredRemittanceElement();
+             el.setInvoiceAmount(
+                 XMLUtil.getElementValue(
+                     remittanceRoot,
+                     ELEMENT_REFERENCED_DOCUMENT_AMOUNT + "/" + ELEMENT_DUE_PAYABLE_AMOUNT,
+                     true));
+             el.setDeductionAmount(
+                 XMLUtil.getElementValue(
+                     remittanceRoot,
+                     ELEMENT_REFERENCED_DOCUMENT_AMOUNT
+                         + "/"
+                         + ELEMENT_ADJUSTMENT_AMOUNT_AND_REASON
+                         + "/"
+                         + ELEMENT_AMOUNT,
+                     true));
+             el.setDeductionDescription(
+                 XMLUtil.getElementValue(
+                     remittanceRoot,
+                     ELEMENT_REFERENCED_DOCUMENT_AMOUNT
+                         + "/"
+                         + ELEMENT_ADJUSTMENT_AMOUNT_AND_REASON
+                         + "/"
+                         + "AddtlInf",
+                     true));
+             el.setInvoiceAmountPaid(
+                 XMLUtil.getElementValue(
+                     remittanceRoot,
+                     ELEMENT_REFERENCED_DOCUMENT_AMOUNT + "/" + ELEMENT_REMITTED_AMOUNT,
+                     true));
+             el.setCreditorNoteAmount(
+                 XMLUtil.getElementValue(
+                     remittanceRoot,
+                     ELEMENT_REFERENCED_DOCUMENT_AMOUNT + "/" + ELEMENT_CREDITOR_NOTE_AMOUNT,
+                     true));
+             el.setTaxAmount(
+                 XMLUtil.getElementValue(
+                     remittanceRoot,
+                     ELEMENT_REFERENCED_DOCUMENT_AMOUNT + "/" + ELEMENT_TAX_AMOUNT,
+                     true));
+             el.setInvoiceNumber(
+                 XMLUtil.getElementValue(
+                     remittanceRoot,
+                     ELEMENT_CREDITOR_REFERENCE_INFORMATION + "/" + ELEMENT_REFERENCE,
+                     true));
+ 
+             final XMLElement[] referencedInfo =
+                 remittanceRoot.getChildren(ELEMENT_REFERENCED_DOCUMENT_INFORMATION);
+ 
+             for (final XMLElement child : referencedInfo) {
+ 
+               final String cd = XMLUtil.getElementValue(child, "Tp/CdOrPrtry/Cd", true);
+ 
+               el.setInvoiceDate(XMLUtil.getElementValue(child, ELEMENT_RELATED_DATE, true));
+               el.setInvoiceDescription(XMLUtil.getElementValue(child, ELEMENT_NUMBER, true));
+ 
+               if (PaymentType.NZD_EFT.equals(paymentType)) {
+                 final String prtry = XMLUtil.getElementValue(child, "Tp/CdOrPrtry/Prtry", true);
+ 
+                 final String issr = XMLUtil.getElementValue(child, "Tp/Issr", true);
+ 
+                 if ("WNZL".equals(issr)) {
+                   if (StringUtils.isBlank(nzParticulars) && "PARTICULARS".equals(prtry)) {
+                     nzParticulars = XMLUtil.getElementValue(child, "Nb", true);
+                   }
+ 
+                   if (StringUtils.isBlank(nzAnalysis) && "ANALYSIS".equals(prtry)) {
+                     nzAnalysis = XMLUtil.getElementValue(child, "Nb", true);
+                   }
+ 
+                   if (StringUtils.isBlank(nzReference) && "REFERENCE".equals(prtry)) {
+                     nzReference = XMLUtil.getElementValue(child, "Nb", true);
+                   }
+                 }
+               }
+             }
+ 
+             final XMLElement[] additionalChildren =
+                 remittanceRoot.getChildren(ADDITIONAL_REMITTANCE_INFORMATION);
+             int addtlRmtInfCount = 0;
+             for (final XMLElement child : additionalChildren) {
+               if (addtlRmtInfCount < 3) {
+                 el.addAdditionalInformation(child.getValue());
+                 addtlRmtInfCount++;
+               }
+             }
+ 
+             structured.add(el);
+             curWriter.writeCharacters("\r\n");
+ 
+             // Ensure the calculation is the same on Linux and Windows
+             payloadSize +=
+                 remittanceRoot
+                     .getXML(false)
+                     .replaceFirst(NAMESPACE_REGEX, "")
+                     .replaceAll("[^\\x00-\\x7F]", " ")
+                     .replace(System.lineSeparator(), "\r\n")
+                     .length();
+ 
+             // Since we can't handle payloads this size in the app, as a last line
+             // of defence, don't write out more than this many characters.
+             // Allow 5000 for the opening and closing payload data.
+             if (payloadSize < 1000000 - 5000) {
+               writePayloadChunk(remittanceRoot, writer);
+             }
+ 
+             structuredElementCount++;
+             if (structuredElementCount > 2000) {
+               break;
+             }
+           }
+         }
+ 
+         // If we have exceeded the remittance limit, write and error and clear the
+         // payment lines.
+         if (structuredElementCount > 2000) {
+           paymentErrors.add(
+               createFileError(
+                   "Payment " + paymentNumber,
+                   "CdtTrfTxInf/RmtInf/Strd",
+                   "",
+                   "Q99",
+                   "",
+                   "Payment contained more than 2000 remittance elements."));
+ 
+           structured.clear();
+         }
+ 
+         if (isRmtInfOpen) {
+           XMLUtil.writeEndElement(curWriter); // Close RmtInf
+         }
+         XMLUtil.writeEndElement(curWriter); // Close CdtTrfTxInf
+ 
+         if (!StringUtil.isEmpty(remittanceFooter)) {
+           XMLUtil.writeElement(curWriter, "Remarks", remittanceFooter);
+         }
+         if (!StringUtil.isEmpty(remittanceRecipientCode)) {
+           XMLUtil.writeElement(curWriter, "RecipientCode", remittanceRecipientCode);
+         }
+         if (!StringUtil.isEmpty(recipientTaxId)) {
+           XMLUtil.writeElement(curWriter, "RecipientTaxId", recipientTaxId);
+         }
+         if (!StringUtil.isEmpty(remittanceLayoutCode)) {
+           XMLUtil.writeElement(curWriter, "RemittanceLayoutCode", remittanceLayoutCode);
+         }
+         if (!StringUtil.isEmpty(returnToAddressIdentifier) && myUseReturnToAddressIdentifier) {
+           XMLUtil.writeElement(curWriter, "ReturnToAddressIdentifier", returnToAddressIdentifier);
+         }
+ 
+         if (StringUtils.isNotBlank(oskoRemittanceType1)) {
+           final XMLDocument oskoPayloadDoc = new XMLDocument();
+           final XMLElement remittanceEl =
+               oskoPayloadDoc.appendElement("OskoRemittanceInformation1", oskoRemittanceType1);
+           writePayloadChunk(remittanceEl, writer);
+         }
+ 
+         if (StringUtils.isNotBlank(oskoRemittanceType2)) {
+           final XMLDocument oskoPayloadDoc = new XMLDocument();
+           final XMLElement remittanceEl =
+               oskoPayloadDoc.appendElement("OskoRemittanceInformation2", oskoRemittanceType2);
+           writePayloadChunk(remittanceEl, writer);
+         }
+ 
+         if (PaymentType.OSKO.equals(paymentType)) {
+           final String poboMerchantIdentifier =
+               XMLUtil.getElementValue(root, "UltmtDbtr/Id/OrgId/Othr/Id", true);
+           if (StringUtils.isNotBlank(poboMerchantIdentifier)) {
+             final XMLDocument oskoPoboPayloadDoc = new XMLDocument();
+             final XMLElement remittanceEl =
+                 oskoPoboPayloadDoc.appendElement(
+                     "POBOMerchantIdentifier", poboMerchantIdentifier);
+             writePayloadChunk(remittanceEl, writer);
+           }
+           final String poboMerchantIdentifierType =
+               XMLUtil.getElementValue(root, "UltmtDbtr/Id/OrgId/Othr/SchmeNm/Cd", true);
+           if (StringUtils.isNotBlank(poboMerchantIdentifierType)) {
+             final XMLDocument oskoPoboPayloadDoc = new XMLDocument();
+             final XMLElement remittanceEl =
+                 oskoPoboPayloadDoc.appendElement(
+                     "POBOMerchantIdentifierType", poboMerchantIdentifierType);
+             writePayloadChunk(remittanceEl, writer);
+           }
+         }
+ 
+         if (StringUtils.isNotBlank(nzParticulars)) {
+           final XMLDocument nzDoc = new XMLDocument();
+           final XMLElement remittanceEl = nzDoc.appendElement("NzParticulars", nzParticulars);
+           writePayloadChunk(remittanceEl, writer);
+         }
+         if (StringUtils.isNotBlank(nzAnalysis)) {
+           final XMLDocument nzDoc = new XMLDocument();
+           final XMLElement remittanceEl = nzDoc.appendElement("NzAnalysis", nzAnalysis);
+           writePayloadChunk(remittanceEl, writer);
+         }
+         if (StringUtils.isNotBlank(nzReference)) {
+           final XMLDocument nzDoc = new XMLDocument();
+           final XMLElement remittanceEl = nzDoc.appendElement("NzReference", nzReference);
+           writePayloadChunk(remittanceEl, writer);
+         }
+ 
+         String tag70RemittanceInformation1 = null;
+         String tag70RemittanceInformation2 = null;
+         // If we have tag70 fields, concatenate them and take the first and second group
+         // of 35 characters and populate the import.
+         if (!tag70RemittanceInformationData.isEmpty()) {
+           String concatenatedTag70Data = "";
+           for (final String data : tag70RemittanceInformationData) {
+             concatenatedTag70Data += data;
+             // If we've got more than our 70 characters of data, break
+             if (concatenatedTag70Data.length() > 70) {
+               break;
+             }
+           }
+ 
+           final boolean twoTags = concatenatedTag70Data.length() > 35;
+           concatenatedTag70Data = StringUtils.truncate(concatenatedTag70Data, 70);
+           tag70RemittanceInformation1 =
+               concatenatedTag70Data.substring(0, twoTags ? 35 : concatenatedTag70Data.length());
+           if (twoTags) {
+             tag70RemittanceInformation2 = concatenatedTag70Data.substring(35);
+           }
+         }
+ 
+         // Write the Tag70 data if we have it present.
+         if (StringUtils.isNotBlank(tag70RemittanceInformation1)) {
+           final XMLDocument tag70PayloadDoc = new XMLDocument();
+           final XMLElement remittanceEl =
+               tag70PayloadDoc.appendElement(
+                   "Tag70RemittanceInformation1", tag70RemittanceInformation1);
+           writePayloadChunk(remittanceEl, writer);
+         }
+         if (StringUtils.isNotBlank(tag70RemittanceInformation2)) {
+           final XMLDocument tag70PayloadDoc = new XMLDocument();
+           final XMLElement remittanceEl =
+               tag70PayloadDoc.appendElement(
+                   "Tag70RemittanceInformation2", tag70RemittanceInformation2);
+           writePayloadChunk(remittanceEl, writer);
+         }
+ 
+         XMLUtil.writeEndElement(curWriter); // Close RemittancePayload
+ 
+         if (myIncludeUnstructuredRemittance) {
+           for (final String value : unstructured) {
+             XMLUtil.writeElement(curWriter, "RemittanceItemPayload", null);
+             XMLUtil.writeElement(curWriter, "InvoiceDescription", value);
+             XMLUtil.writeEndElement(curWriter);
+           }
+         }
+ 
+         for (final StructuredRemittanceElement el : structured) {
+           String invoiceAmount = StringUtil.trim(el.getInvoiceAmount());
+           String deductionAmount = StringUtil.trim(el.getDeductionAmount());
+           String invoiceAmountPaid = StringUtil.trim(el.getInvoiceAmountPaid());
+           String creditorNoteAmount = StringUtil.trim(el.getCreditorNoteAmount());
+ 
+           boolean isCreditNote = false;
+           if (!StringUtil.isEmpty(creditorNoteAmount)) {
+             final BigDecimal creditorNoteAmountBD = new BigDecimal(creditorNoteAmount);
+             creditorNoteAmount = creditorNoteAmountBD.multiply(NEGATE).toString();
+             isCreditNote = true;
+           }
+ 
+           String taxAmount = StringUtil.trim(el.getTaxAmount());
+           final String invoiceNumber = el.getInvoiceNumber();
+           String invoiceDate = el.getInvoiceDate();
+           final String invoiceDescription = el.getInvoiceDescription();
+ 
+           // Write unstructured remittance info
+           XMLUtil.writeElement(curWriter, "RemittanceItemPayload", null);
+           if (!StringUtil.isEmptyTrim(invoiceNumber)) {
+             XMLUtil.writeElement(curWriter, "InvoiceNumber", invoiceNumber);
+           }
+ 
+           // Use creditorNote if exists, otherwise use DuePyblAmt
+           invoiceAmount =
+               !StringUtil.isEmptyTrim(creditorNoteAmount) ? creditorNoteAmount : invoiceAmount;
+           final String originalInvoiceAmount = invoiceAmount;
+           // If neither exist, omit
+           if (!StringUtil.isEmptyTrim(invoiceAmount)) {
+             invoiceAmount = Long.toString(MoneyFormatter.convertToCents(invoiceAmount));
+             if (myNegateCreditNoteAmounts && isCreditNote) {
+               final BigDecimal invoiceAmountBD = new BigDecimal(invoiceAmount);
+               invoiceAmount = invoiceAmountBD.multiply(NEGATE).toString();
+             }
+             XMLUtil.writeElement(curWriter, "InvoiceAmount", invoiceAmount);
+           }
+ 
+           // Use RmtdAmt if exists, otherwise use previous
+           // invoiceAmount
+           invoiceAmountPaid =
+               !StringUtil.isEmptyTrim(invoiceAmountPaid)
+                   ? invoiceAmountPaid
+                   : originalInvoiceAmount;
+           // if invoiceAmount doesn't exist, omit completely
+           if (!StringUtil.isEmptyTrim(invoiceAmountPaid)) {
+             invoiceAmountPaid = Long.toString(MoneyFormatter.convertToCents(invoiceAmountPaid));
+             if (myNegateCreditNoteAmounts && isCreditNote) {
+               final BigDecimal invoiceAmountPaidBD = new BigDecimal(invoiceAmountPaid);
+               invoiceAmountPaid = invoiceAmountPaidBD.multiply(NEGATE).toString();
+             }
+             XMLUtil.writeElement(curWriter, "InvoiceAmountPaid", invoiceAmountPaid);
+           }
+ 
+           // Use Amt, otherwise omit
+           if (!StringUtil.isEmptyTrim(deductionAmount)) {
+             deductionAmount = Long.toString(MoneyFormatter.convertToCents(deductionAmount));
+             XMLUtil.writeElement(curWriter, "DeductionAmount", deductionAmount);
+           }
+           if (StringUtils.isNotEmpty(el.getDeductionDescription())) {
+             XMLUtil.writeElement(curWriter, "DeductionDescription", el.getDeductionDescription());
+           }
+           if (!StringUtil.isEmptyTrim(invoiceDate)) {
+             invoiceDate = INVOICE_DATE_FORMAT.format(RELATED_DATE_FORMAT.parse(invoiceDate));
+             XMLUtil.writeElement(curWriter, "InvoiceDate", invoiceDate);
+           }
+           if (!StringUtil.isEmptyTrim(invoiceDescription)) {
+             XMLUtil.writeElement(curWriter, "InvoiceDescription", invoiceDescription);
+           }
+           if (!StringUtil.isEmpty(taxAmount)) {
+             taxAmount = Long.toString(MoneyFormatter.convertToCents(taxAmount));
+             if (myNegateCreditNoteAmounts && isCreditNote) {
+               final BigDecimal taxAmountBD = new BigDecimal(taxAmount);
+               taxAmount = taxAmountBD.multiply(NEGATE).toString();
+             }
+             XMLUtil.writeElement(curWriter, "TaxAmount", taxAmount);
+           }
+ 
+           for (final String additionalInformation : el.getAdditionalInformation()) {
+             if (!StringUtil.isEmpty(additionalInformation)) {
+               XMLUtil.writeElement(curWriter, "AdditionalInformation", additionalInformation);
+             }
+           }
+ 
+           // Close RemittanceItemPayload
+           XMLUtil.writeEndElement(curWriter);
+         }
+ 
+         // Write out the individual payment errors here
+         for (final FileError error : paymentErrors) {
+           ppimBuilder.writeErrorSegment(curWriter, writer, error);
+         }
+ 
+         XMLUtil.writeEndElement(curWriter); // Close Payment
+       }
+     }
+ 
+     if (curWriter != null) {
+       ppimBuilder.closePPIM(curWriter, writer);
+     }
+   } catch (final SAXException s) {
+     // ignore SAXExceptions thrown for convenience method document
+     // parsing errors
+     if (myErrors.isEmpty()) {
+       throw s;
+     }
+   } catch (final Exception e) {
+     // Catch all other exceptions
+     throw new CoreException("An error occurred during DOM processing", e);
+   } finally {
+     try {
+       dom.close();
+     } catch (final Exception ignore) {
+ 
+     }
+     try {
+       curWriter.close();
+     } catch (final Exception ignore) {
+ 
+     }
+     try {
+       writer.close();
+     } catch (final Exception ignore) {
+ 
+     }
+   }
+ }
+ 
+ private boolean shouldTruncate(final String truncateLodgementReference) {
+   return truncateLodgementReference == null
+       ? false
+       : SHOULD_TRUNCATE_PATTERN.matcher(truncateLodgementReference).matches();
+ }
+ 
+ private void writePayloadChunk(final XMLElement doc, final Writer writer) throws CoreException {
+   XMLEventReader xer = null;
+   XMLEventWriter xew = null;
+ 
+   try (final StringReader stringReader =
+       new StringReader(
+           doc.getXML(false)
+               .replaceFirst(NAMESPACE_REGEX, "")
+               .replaceAll("[^\\x00-\\x7F]", " ")); ) {
+     xer = myXMLInputFactory.createXMLEventReader(new BufferedReader(stringReader));
+ 
+     xew = myXMLOutputFactory.createXMLEventWriter(writer);
+     // skip xml declaration
+     xer.next();
+ 
+     xew.add(xer);
+     xew.flush();
+   } catch (final Exception e) {
+     final String error = "Could not write Remittance Payload";
+     myErrors.add(error);
+     throw new CoreException(error, e);
+   } finally {
+     try {
+       xer.close();
+     } catch (final Exception ignore) {
+     }
+     try {
+       xew.close();
+     } catch (final Exception ignore) {
+     }
+   }
+ }
+ 
+ /**
+   * This method parses the PAIN001 file and determines if we have multiple logical files in the one
+   * physical files.
+   */
+ private boolean hasChildFiles(final MessageFacade message) throws Exception {
+   try (final DOMExtractor dom = new DOMExtractor(message.getXmlReader())) {
+     int numberOfFiles = 0;
+ 
+     final String pmtInf =
+         ELEMENT_DOCUMENT + "/" + ELEMENT_PAIN + "/" + ELEMENT_PAYMENT_INFORMATION;
+     final String endElem =
+         ELEMENT_DOCUMENT
+             + "/"
+             + ELEMENT_PAIN
+             + "/"
+             + ELEMENT_PAYMENT_INFORMATION
+             + "/"
+             + ELEMENT_CREDIT_TRANSFER_TRANSACTION_INFORMATION;
+ 
+     for (final Document doc : dom.documentExcerpts(pmtInf, endElem)) {
+       final XMLElement elem = new XMLElement(doc.getDocumentElement());
+       if (StringUtils.isNotBlank(elem.getChildValue("PmtInfId"))) {
+         numberOfFiles++;
+       }
+     }
+ 
+     return numberOfFiles > 1;
+   }
+ }
+ 
+ private void createEmptyParentMessage(
+     final PPIMSegmentBuilderUtil ppimBuilder,
+     final MessageFacade parentMessage,
+     final String paymentDate,
+     final String fileReference,
+     final String fileName,
+     final String payablesFileId,
+     final String grpHdrPayLoad,
+     final String pmtInfXML)
+     throws Exception {
+   final MessageFacade emptyParentFile =
+       myMessageManager.createStreamedXmlMessage(
+           "PaymentsPlusPaymentImportMessage", parentMessage);
+   myResultantMessages.add(emptyParentFile);
+   myDetailRecords.add(0);
+   mySumOfTransactions.add(0.0);
+ 
+   XMLStreamWriter curWriter = null;
+ 
+   try (final Writer writer = emptyParentFile.getXmlWriter(); ) {
+     curWriter = myXMLOutputFactory.createXMLStreamWriter(writer);
+ 
+     ppimBuilder.writeHeaderSegment(
+         writer,
+         curWriter,
+         myBuyerCode,
+         paymentDate,
+         "",
+         myTokenizeSettlementReference,
+         fileReference,
+         fileName,
+         grpHdrPayLoad,
+         pmtInfXML,
+         payablesFileId,
+         false,
+         true,
+         mySkipDuplicateFileChecks,
+         Collections.EMPTY_LIST);
+ 
+     ppimBuilder.closePPIM(curWriter, writer);
+   } finally {
+     try {
+       curWriter.close();
+     } catch (final Exception ignore) {
+     }
+   }
+ }
+ 
+ /**
+   * sendFailureEmail send failure email
+   *
+   * @param MessageFacade message - iCIS message
+   * @param Map parameters - rule parameters
+   * @return void @Exception CoreException
+   */
+ private void sendFailureEmail(final MessageFacade message, final Map<String, String> parameters)
+     throws CoreException {
+   String emailSubject = new String();
+   final StringBuilder emailBody = new StringBuilder();
+ 
+   emailSubject =
+       "(Message: #"
+           + message.getMessageId()
+           + ") Error processing "
+           + "PAIN001 File - ISO20022 PAIN001 to PPIM process";
+ 
+   emailBody.append(
+       "Errors occurred during the processing of " + "the input PAIN001 file." + NEW_LINE);
+   if (StringUtils.isNotBlank(
+       message.getParameter(iCISScriptParameterUtil.MSG_PARAM_RECEIVED_FILE))) {
+     emailBody.append("Received filename: ");
+     emailBody.append(message.getParameter(iCISScriptParameterUtil.MSG_PARAM_RECEIVED_FILE));
+     emailBody.append(NEW_LINE);
+     emailBody.append(NEW_LINE);
+   }
+ 
+   emailBody.append(
+       "(Displaying "
+           + (myErrors.size() < MAX_ERRORS ? myErrors.size() : MAX_ERRORS)
+           + " of "
+           + myErrors.size()
+           + " errors.)");
+ 
+   for (int i = 0; i < myErrors.size() && i < MAX_ERRORS; i++) {
+     emailBody.append(NEW_LINE + NEW_LINE + myErrors.get(i));
+   }
+ 
+   emailBody.append(NEW_LINE + NEW_LINE);
+   emailBody.append(iCISScriptEmailUtil.getMailFooter((HashMap<String, String>) parameters));
+   parameters.put(iCISScriptParameterUtil.SUBJECT_EMAIL_PARAM, emailSubject);
+   iCISScriptEmailUtil.sendMail(
+       (HashMap<String, String>) parameters, emailBody.toString(), message.getMessageId(), null);
+ }
+ 
+ private FileError createFileError(
+     final String location,
+     final String fieldName,
+     final String fieldValue,
+     final String errorCode,
+     final String errorDesc,
+     final String message) {
+   final FileError error = new FileError();
+   error.setLocation(location);
+   error.setFieldName(fieldName);
+   error.setFieldValue(fieldValue);
+   error.setErrorCode(errorCode);
+   error.setErrorDescription(errorDesc);
+   error.setMessage(message);
+ 
+   return error;
+ }
+ 
+ private MessageFacade writeFileLevelErrorImport(
+     final MessageFacade parentMessage,
+     final String buyerCode,
+     final String fileName,
+     final String payablesFileId,
+     final String errorMessage)
+     throws Exception {
+   myXMLOutputFactory = XMLOutputFactory.newInstance();
+   myXMLOutputFactory.setProperty(XMLOutputFactory.IS_REPAIRING_NAMESPACES, false);
+   myXMLInputFactory = XMLInputFactory.newInstance();
+   myXMLInputFactory.setProperty(XMLInputFactory.IS_NAMESPACE_AWARE, false);
+ 
+   final PPIMSegmentBuilderUtil ppimBuilder =
+       new PPIMSegmentBuilderUtil(myXMLInputFactory, myXMLOutputFactory);
+ 
+   final MessageFacade resultMessage =
+       myMessageManager.createStreamedXmlMessage(
+           "PaymentsPlusPaymentImportMessage", parentMessage);
+ 
+   try (final Writer writer = resultMessage.getXmlWriter(); ) {
+     final XMLStreamWriter curWriter = myXMLOutputFactory.createXMLStreamWriter(writer);
+ 
+     final List<FileError> errors = new ArrayList<>();
+     errors.add(
+         createFileError("File", "Content", null, "Q99", "Invalid File Structure", errorMessage));
+ 
+     ppimBuilder.writeHeaderSegment(
+         writer,
+         curWriter,
+         buyerCode,
+         PAYMENT_DATE_OUTPUT_FORMAT.format(parentMessage.getCreatedDate()),
+         "",
+         true,
+         null,
+         fileName,
+         null,
+         null,
+         payablesFileId,
+         false,
+         false,
+         mySkipDuplicateFileChecks,
+         errors);
+ 
+     ppimBuilder.closePPIM(curWriter, writer);
+   }
+ 
+   return resultMessage;
+ }
+ 
+ protected Date getDate() {
+   return new Date();
+ }
+}
